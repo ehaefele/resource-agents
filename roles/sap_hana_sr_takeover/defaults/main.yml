@@ -2,17 +2,21 @@
 # defaults file for hana_sr_takeover
 #
 # Define the new primary
-sap_hana_sr_takeover_primary:
+sap_hana_sr_takeover_primary: ''
 
 # Machine to be the primary (can be run twice if more than one secondary)
-sap_hana_sr_takeover_secondary:
+sap_hana_sr_takeover_secondary: ''
 # Name of the site being registered
-sap_hana_sr_takeover_sitename:
+sap_hana_sr_takeover_sitename: ''
 
-# Default replication method
-sap_hana_sr_takeover_rep_mode: sync
-sap_hana_sr_takeover_hsr_oper_mode: logreplay
+# Default HANA system replication mode. Options 'sync', 'syncmem', 'async'
+sap_hana_sr_takeover_rep_mode: 'sync'
+# Default HANA system replication operation mode. Options 'delta_datashipping', 'logreplay', 'logreplay_readaccess'
+sap_hana_sr_takeover_hsr_oper_mode: 'logreplay'
+# Takeover with handshake: true or false
+sap_hana_sr_takeover_handshake: false
+
 
 # Common HANA Database parameter
-sap_hana_sid:
-sap_hana_instance_number:
+sap_hana_sid: ''
+sap_hana_instance_number: ''

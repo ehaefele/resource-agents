@@ -1,0 +1,48 @@
+---
+- name: Assert that the variable 'sap_hana_sid' is valid
+  ansible.builtin.assert:
+    that:
+      - sap_hana_sid is defined
+      - sap_hana_sid is string
+      - sap_hana_sid is match ('[A-Z][A-Z0-9]{2}')
+      - sap_hana_sid | trim | length == 3
+    fail_msg: |
+      The variable 'sap_hana_sid' is undefined or invalid!
+
+- name: Assert that the variable 'sap_hana_instance_number' is valid
+  ansible.builtin.assert:
+    that:
+      - sap_hana_instance_number is defined
+      - sap_hana_instance_number is string
+      - sap_hana_instance_number is match ('[0-9]{2}')
+      - sap_hana_instance_number | trim | length == 2
+    fail_msg: |
+      The variable 'sap_hana_instance_number' is undefined or invalid!
+
+- name: Assert that the variable 'sap_hana_sr_takeover_sitename' is valid
+  ansible.builtin.assert:
+    that:
+      - sap_hana_sr_takeover_sitename is defined
+      - sap_hana_sr_takeover_sitename is string
+    fail_msg: |
+      The variable 'sap_hana_sr_takeover_sitename' is undefined or invalid!
+
+- name: Assert that the variable 'sap_hana_sr_takeover_rep_mode' is valid
+  ansible.builtin.assert:
+    that:
+      - sap_hana_sr_takeover_rep_mode is defined
+      - sap_hana_sr_takeover_rep_mode is string
+      - sap_hana_sr_takeover_rep_mode is in ['sync', 'syncmem', 'async']
+    fail_msg: |
+      The variable 'sap_hana_sr_takeover_rep_mode' is undefined or invalid!
+      Available options: sync, syncmem, async
+
+- name: Assert that the variable 'sap_hana_sr_takeover_hsr_oper_mode' is valid
+  ansible.builtin.assert:
+    that:
+      - sap_hana_sr_takeover_hsr_oper_mode is defined
+      - sap_hana_sr_takeover_hsr_oper_mode is string
+      - sap_hana_sr_takeover_hsr_oper_mode is in ['delta_datashipping', 'logreplay', 'logreplay_readacces']
+    fail_msg: |
+      The variable 'sap_hana_sr_takeover_hsr_oper_mode' is undefined or invalid!
+      Available options: delta_datashipping, logreplay, logreplay_readacces
