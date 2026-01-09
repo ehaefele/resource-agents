@@ -604,8 +604,8 @@ prepare_env() {
 	fi
 	ETCD_ELECTION_TIMEOUT=$(get_env_from_manifest "ETCD_ELECTION_TIMEOUT")
 	ETCD_ENABLE_PPROF=$(get_env_from_manifest "ETCD_ENABLE_PPROF")
-	ETCD_EXPERIMENTAL_WARNING_APPLY_DURATION=$(get_env_from_manifest "ETCD_EXPERIMENTAL_WARNING_APPLY_DURATION")
-	ETCD_EXPERIMENTAL_WATCH_PROGRESS_NOTIFY_INTERVAL=$(get_env_from_manifest "ETCD_EXPERIMENTAL_WATCH_PROGRESS_NOTIFY_INTERVAL")
+	ETCD_WARNING_APPLY_DURATION=$(get_env_from_manifest "ETCD_WARNING_APPLY_DURATION")
+	ETCD_WATCH_PROGRESS_NOTIFY_INTERVAL=$(get_env_from_manifest "ETCD_WATCH_PROGRESS_NOTIFY_INTERVAL")
 	ETCD_HEARTBEAT_INTERVAL=$(get_env_from_manifest "ETCD_HEARTBEAT_INTERVAL")
 	ETCD_QUOTA_BACKEND_BYTES=$(get_env_from_manifest "ETCD_QUOTA_BACKEND_BYTES")
 	ETCD_SOCKET_REUSE_ADDRESS=$(get_env_from_manifest "ETCD_SOCKET_REUSE_ADDRESS")
@@ -617,9 +617,13 @@ prepare_env() {
 	LISTEN_CLIENT_URLS="0.0.0.0"
 	LISTEN_PEER_URLS="0.0.0.0"
 	LISTEN_METRICS_URLS="0.0.0.0"
+
+	return $OCF_SUCCESS
 }
 
 compute_bump_revision() {
+	local rc
+
 	# Same logic used by cluster-etcd-operator quorum-restore-pod utility.
 	# see https://github.com/openshift/cluster-etcd-operator/blob/215998939f5223da916622c71fd07d17656faf6b/bindata/etcd/quorum-restore-pod.yaml#L26-L34
 	# set a default value: 1bn would be an etcd running at 1000 writes/s for about eleven days.
@@ -656,6 +660,7 @@ force-new-cluster-bump-amount: $BUMP_REV"
 
 	# the space indentation for client-transport-security and peer-transport-security
 	# is required for correct YAML formatting.
+	# TODO: replace flags deprecated in Etcd v3.6
 	cat > "$ETCD_CONFIGURATION_FILE" << EOF
 logger: zap
 log-level: info
@@ -688,10 +693,16 @@ listen-metrics-urls: "$(ip_url ${LISTEN_METRICS_URLS}):9978"
 metrics: extensive
 experimental-initial-corrupt-check: true
 experimental-max-learners: 1
-experimental-warning-apply-duration: $(convert_duration_in_nanoseconds "$ETCD_EXPERIMENTAL_WARNING_APPLY_DURATION")
-experimental-watch-progress-notify-interval: $(convert_duration_in_nanoseconds "$ETCD_EXPERIMENTAL_WATCH_PROGRESS_NOTIFY_INTERVAL")
+experimental-warning-apply-duration: $(convert_duration_in_nanoseconds "$ETCD_WARNING_APPLY_DURATION")
+experimental-watch-progress-notify-interval: $(convert_duration_in_nanoseconds "$ETCD_WATCH_PROGRESS_NOTIFY_INTERVAL")
 EOF
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		ocf_log err "could not create etcd configuration, 'cat' error code: $rc"
+		return $OCF_ERR_CONFIGURED
+	fi
 
+	# Append cipher suites from the env variable where the entries are comma separated.
 	{
 		if [ -n "$ETCD_CIPHER_SUITES" ]; then
 			echo "cipher-suites:"
@@ -700,6 +711,13 @@ EOF
 			done
 		fi
 	} >> "$ETCD_CONFIGURATION_FILE"
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		ocf_log err "could not append cipher suites to etcd configuration, error code: $rc"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	return $OCF_SUCCESS
 }
 
 archive_data_folder()
@@ -720,8 +738,8 @@ archive_data_folder()
 
 etcd_pod_container_exists() {
 	local count_matches
-	# Check whether the etcd pod exists on the same node (header line included)
-	count_matches=$(crictl pods --label app=etcd -q | xargs -I {} crictl ps --pod {} -o json | jq -r '.containers[].metadata | select ( .name == "etcd" ).name' | wc -l)
+	# Check whether the etcd pod exists on the same node (including stopped/exited containers)
+	count_matches=$(crictl pods --label app=etcd -q | xargs -I {} crictl ps -a --pod {} -o json | jq -r '.containers[].metadata | select ( .name == "etcd" ).name' | wc -l)
 	if [ "$count_matches" -eq 1 ]; then
 		# etcd pod found
 		return 0
@@ -880,11 +898,11 @@ add_member_as_learner()
 	local endpoint_url=$(ip_url $(attribute_node_ip get))
 	local peer_url=$(ip_url $member_ip)
 
-	ocf_log info "add $member_name ($member_ip, $endpoint_url) to the member list as learner"
+	ocf_log info "add $member_name ($member_ip) to the member list as learner"
 	out=$(podman exec "${CONTAINER}" etcdctl --endpoints="$endpoint_url:2379" member add "$member_name" --peer-urls="$peer_url:2380" --learner)
 	rc=$?
 	if [ $rc -ne 0 ]; then
-		ocf_log err "could not add $member_name as learner, error code: $rc"
+		ocf_log err "could not add $member_name as learner, error code $rc, etcdctl output: $out"
 		return $rc
 	fi
 	ocf_log info "$out"
@@ -1032,7 +1050,7 @@ promote_learner_member()
 	if ! ocf_run podman exec "${CONTAINER}" etcdctl member promote "$learner_member_id_hex" 2>&1; then
 		# promotion is expected to fail if the peer is not yet up-to-date
 		ocf_log info "could not promote member $learner_member_id_hex, error code: $?"
-		return $OCF_SUCCESS
+		return $OCF_ERR_GENERIC
 	fi
 	ocf_log info "successfully promoted member '$learner_member_id_hex'"
 	return $OCF_SUCCESS
@@ -1063,19 +1081,19 @@ reconcile_member_state()
 	fi
 
 	if [ -n "$learner_member_id" ]; then
-		promote_learner_member "$learner_member_id"
-		return $?
+		if ! promote_learner_member "$learner_member_id"; then
+			return $OCF_ERR_GENERIC
+		fi
+		# promotion succeded: continue to clear standalone_node and learner_node
 	fi
 
-	if [ -z "$learner_member_id" ]; then
-		if ! clear_standalone_node; then
-			ocf_log error "could not clear standalone_node attribute, error code: $?"
-			return $OCF_ERR_GENERIC
-		fi
-		if ! attribute_learner_node clear; then
-			ocf_log error "could not clear learner_node attribute, error code: $?"
-			return $OCF_ERR_GENERIC
-		fi
+	if ! clear_standalone_node; then
+		ocf_log error "could not clear standalone_node attribute, error code: $?"
+		return $OCF_ERR_GENERIC
+	fi
+	if ! attribute_learner_node clear; then
+		ocf_log error "could not clear learner_node attribute, error code: $?"
+		return $OCF_ERR_GENERIC
 	fi
 
 	return $OCF_SUCCESS
@@ -1258,6 +1276,7 @@ manage_peer_membership()
 			set_standalone_node
 		else
 			ocf_log debug "$name is in the members list by IP: $ip"
+			# Errors from reconcile_member_state are logged internally. Ignoring them here prevents stopping a healthy voter agent; critical local failures are caught by detect_cluster_leadership_loss.
 			reconcile_member_state "$member_list_json"
 		fi
 	done
@@ -1366,10 +1385,10 @@ container_health_check()
 		return
 	fi
 
-	# State file exists - the container failed, check recovery status in this lifecycle
+	# Could not execute monitor check command and state file exists - the container failed, check recovery status in this lifecycle
 	local time_since_heartbeat
 	time_since_heartbeat=$(get_time_since_last_heartbeat)
-	ocf_log err "Container ${CONTAINER} failed (last healthy: ${time_since_heartbeat}s ago)"
+	ocf_log err "Container ${CONTAINER} failed (last healthy: ${time_since_heartbeat}s ago, error code: $rc)"
 
 	# Check if peer has set force_new_cluster for recovery
 	local fnc_holders
@@ -1379,8 +1398,9 @@ container_health_check()
 		return
 	fi
 
-	if [ -n "$fnc_holders" ]; then
-		ocf_log debug "force_new_cluster detected (set by: $fnc_holders), triggering restart"
+	local fnc_holder_count=$(echo "$fnc_holders" | wc -w)
+	if [ "$fnc_holder_count" -gt 0 ]; then
+		ocf_log info "force_new_cluster detected (set by: $fnc_holders), triggering restart"
 		echo "failed-restart-now"
 		return
 	fi
@@ -1638,7 +1658,6 @@ can_reuse_container() {
 		OCF_RESKEY_reuse=0
 		return "$OCF_SUCCESS"
 	fi
-	
 	if ! filtered_original_pod_manifest=$(filter_pod_manifest "$OCF_RESKEY_pod_manifest"); then
 		return $OCF_ERR_GENERIC
 	fi
@@ -1762,7 +1781,7 @@ podman_start()
 		fnc_holder_count=$(echo "$fnc_holders" | wc -w)
 		if [ "$fnc_holder_count" -gt 1 ]; then
 			ocf_exit_reason "force_new_cluster attribute is set on multiple nodes ($fnc_holders)"
-			return "$OCF_ERR_GENERIC"
+			return "$OCF_ERR_CONFIGURED"
 		fi
 
 		if [ "$fnc_holder_count" -eq 1 ]; then
@@ -1795,6 +1814,9 @@ podman_start()
 				fi
 				;;
 			0)
+				# No active resources: clear any stale learner_node attribute from previous failed session
+				ocf_log debug "clearing stale learner_node attribute (safe when active_resources_count=0)"
+				attribute_learner_node clear
 				# count how many agents are starting now
 				local start_resources_count
 				start_resources_count=$(echo "$OCF_RESKEY_CRM_meta_notify_start_resource" | wc -w)
@@ -1833,7 +1855,7 @@ podman_start()
 							ocf_log info "same cluster_id and revision: start normal"
 						else
 							ocf_exit_reason "same revision but different cluster id"
-							return "$OCF_ERR_GENERIC"
+							return "$OCF_ERR_CONFIGURED"
 						fi
 					fi
 					;;
@@ -1857,12 +1879,6 @@ podman_start()
 	local run_opts="--detach --name=${CONTAINER} --replace"
 
 	run_opts="$run_opts --oom-score-adj=${OCF_RESKEY_oom}"
-
-	# check to see if the container has already started
-	podman_simple_status
-	if [ $? -eq $OCF_SUCCESS ]; then
-		return "$OCF_SUCCESS"
-	fi
 
 	if ocf_is_true "$JOIN_AS_LEARNER"; then
 		local wait_timeout_sec=$((10*60))
@@ -1890,9 +1906,8 @@ podman_start()
 
 	ocf_log info "check for changes in pod manifest to decide if the container should be reused or replaced"
 	if ! can_reuse_container ; then
-		rc="$?"
-		ocf_log err "could not determine etcd container reuse strategy, rc: $rc"
-		return "$rc"
+		ocf_log err "could not determine etcd container reuse strategy"
+		return $OCF_ERR_GENERIC
 	fi
 
 	# Archive current container and its configuration before creating
@@ -1908,13 +1923,13 @@ podman_start()
 	fi
 
 	if ! prepare_env; then
-		ocf_log err "Could not prepare environment for podman, error code: $?"
+		ocf_log err "Could not prepare environment for podman"
 		return $OCF_ERR_GENERIC
 	fi
 
 	if ! generate_etcd_configuration; then
-		ocf_log err "Could not generate etcd configuration, error code: $?"
-		return $OCF_ERR_GENERIC
+		ocf_log err "Could not generate etcd configuration"
+		return $OCF_ERR_CONFIGURED
 	fi
 
 	run_opts="$run_opts \
@@ -2020,6 +2035,64 @@ podman_start()
 	done
 }
 
+# leave_etcd_member_list removes the current node from the etcd member list during
+# shutdown to ensure clean cluster state.
+#
+# Skips removal if this is the standalone (last) node. When both nodes are stopping
+# concurrently, delays the second node to prevent simultaneous member removal that
+# could corrupt the etcd WAL.
+leave_etcd_member_list()
+{
+	if ! member_id=$(attribute_node_member_id get); then
+		ocf_log err "error leaving members list: could not get member-id"
+		return
+	fi
+
+	if is_standalone; then
+		ocf_log info "last member. Not leaving the member list"
+		return
+	fi
+
+	local stopping_resources_count
+	stopping_resources_count=$(echo "$OCF_RESKEY_CRM_meta_notify_stop_resource" | wc -w)
+	ocf_log info "found '$stopping_resources_count' stopping etcd resources (stop: '$OCF_RESKEY_CRM_meta_notify_stop_resource')"
+	if [ "$stopping_resources_count" -gt 1 ]; then
+		# Prevent WAL corruption by delaying the alphabetically second node's member
+		# removal when both nodes are stopping concurrently.
+		local delayed_node
+
+		node_names_sorted=$(echo "$OCF_RESKEY_node_ip_map" | sed 's/:[^;]*//g; s/;/ /g' | tr ' ' '\n' | sort  | tr '\n' ' ')
+		delayed_node="$(echo "$node_names_sorted" | cut -d' ' -f2)"
+
+		if [ -z "$delayed_node" ]; then
+			ocf_log warn "could not determine node to be delayed: not leaving the member list"
+			return
+		fi
+
+		if [ "$NODENAME" = "$delayed_node" ]; then
+			ocf_log info "delaying stop for ${DELAY_SECOND_NODE_LEAVE_SEC}s to prevent simultaneous etcd member removal"
+			sleep $DELAY_SECOND_NODE_LEAVE_SEC
+		fi
+	fi
+
+	# Ensure we're not the last active resource before leaving. The `standalone_node` property
+	# may not be set if stop was called before monitor check, or after the delayed node waited.
+	local active_resources_count
+	active_resources_count=$(get_truly_active_resources_count)
+	if [ "$active_resources_count" -lt 1 ]; then
+		ocf_log info "last member. Not leaving the member list"
+		return
+	fi
+
+	ocf_log info "leaving members list as member with ID $member_id"
+	local endpoint
+	endpoint="$(ip_url $(attribute_node_ip get)):2379"
+	if ! ocf_run podman exec "$CONTAINER" etcdctl member remove "$member_id" --endpoints="$endpoint"; then
+		rc=$?
+		ocf_log err "error leaving members list, error code: $rc"
+	fi
+}
+
 podman_stop()
 {
 	local timeout=60
@@ -2032,30 +2105,19 @@ podman_stop()
 		ocf_log err "could not delete container health check state file"
 	fi
 
+	attribute_learner_node clear
 	attribute_node_revision update
 	attribute_node_cluster_id update
 
 	podman_simple_status
 	if [ $? -eq  $OCF_NOT_RUNNING ]; then
 		ocf_log info "could not leave members list: etcd container not running"
+		attribute_node_member_id clear
 		return $OCF_SUCCESS
 	fi
 
-	if ! member_id=$(attribute_node_member_id get); then
-		ocf_log err "error leaving members list: could not get member-id"
-	else
-		# TODO: is it worth/possible to check the current status instead than relying on cached attributes?
-		if is_standalone; then
-			ocf_log info "last member. Not leaving the member list"
-		else
-			ocf_log info "leaving members list as member with ID $member_id"
-			endpoint="$(ip_url $(attribute_node_ip get)):2379"
-			if ! ocf_run podman exec "$CONTAINER" etcdctl member remove "$member_id" --endpoints="$endpoint"; then
-				rc=$?
-				ocf_log err "error leaving members list, error code: $rc"
-			fi
-		fi
-	fi
+	leave_etcd_member_list
+	# clear node_member_id CIB attribute only after leaving the member list
 	attribute_node_member_id clear
 
 	if [ -n "$OCF_RESKEY_CRM_meta_timeout" ]; then
@@ -2196,6 +2258,7 @@ ETCD_CERTS_HASH_FILE="${OCF_RESKEY_config_location}/certs.hash"
 # State file location: Uses HA_RSCTMP to ensure automatic cleanup on reboot.
 # This is intentional - reboots are controlled stops, not failures requiring detection.
 CONTAINER_HEARTBEAT_FILE=${HA_RSCTMP}/podman-container-last-running
+DELAY_SECOND_NODE_LEAVE_SEC=10
 
 # Note: we currently monitor podman containers by with the "podman exec"
 # command, so make sure that invocation is always valid by enforcing the
