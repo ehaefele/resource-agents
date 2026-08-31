@@ -20,16 +20,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ------------------------------------------------------------------------
-
 import fcntl
 import ipaddress
 import json
 import os
+import re
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
+from enum import Enum, IntEnum
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -42,9 +45,14 @@ OCF_FUNCTIONS_DIR = os.environ.get(
     "OCF_FUNCTIONS_DIR", "%s/lib/heartbeat" % os.environ.get("OCF_ROOT")
 )
 
+
 RESOURCE_AGENT_NAME = "powervs-move-ip"
-RESOURCE_AGENT_TIMEOUT = 60
+ROUTE_POLL_INTERVAL = 2  # polling interval
+RESOURCE_AGENT_START_TIMEOUT = 240
+RESOURCE_AGENT_STOP_TIMEOUT = 120
+RESOURCE_AGENT_MONITOR_TIMEOUT = 30
 RESOURCE_AGENT_INTERVAL = 60
+RESOURCE_AGENT_TIMEOUT_BUFFER = 5
 RESOURCE_AGENT_OPTIONS = (
     "ip",
     "api_key",
@@ -57,20 +65,142 @@ RESOURCE_AGENT_OPTIONS = (
     "iflabel",
     "proxy",
     "profile",
+    "atomic",
 )
 
 OCF_RESOURCE_INSTANCE = os.environ.get("OCF_RESOURCE_INSTANCE", RESOURCE_AGENT_NAME)
 IP_CMD = "/usr/sbin/ip"
-CRM_ATTRIBUTE_CMD = "/usr/sbin/crm_attribute"
-CRM_ATTR_REMOTE_ROUTE_STATUS = OCF_RESOURCE_INSTANCE.lower() + "_remote_route_status"
-CMD_TIMEOUT = 10
 CIDR_NETMASK = "32"
 IFLABEL_MAX_LEN = 15  # Maximum character limit for interface labels
-REQUESTS_TIMEOUT = 5  # Timeout for requests calls
+REQUESTS_CONNECT_TIMEOUT = 5  # TCP connection timeout for HTTP requests (seconds)
+REQUESTS_READ_TIMEOUT_SHORT = (
+    30  # Read timeout for token/metadata and route GET calls (seconds)
+)
+REQUESTS_READ_TIMEOUT_LONG = 60  # Read timeout for route PUT/POST calls (seconds)
+REQUESTS_TIMEOUT = (
+    REQUESTS_CONNECT_TIMEOUT,
+    REQUESTS_READ_TIMEOUT_SHORT,
+)  # default: (connect, read)
+REQUESTS_TIMEOUT_WRITE = (
+    REQUESTS_CONNECT_TIMEOUT,
+    REQUESTS_READ_TIMEOUT_LONG,
+)  # for route PUT/POST: (connect, read)
 HTTP_MAX_RETRIES = 4  # Maximum number of retries for HTTP requests
 HTTP_BACKOFF_FACTOR = 0.3  # Sleep (factor * (2^number of previous retries)) secs
-HTTP_STATUS_FORCE_RETRIES = (500, 502, 503, 504)  # HTTP status codes to retry on
+HTTP_STATUS_FORCE_RETRIES = (429, 500, 502, 503, 504)  # HTTP status codes to retry on
 HTTP_RETRY_ALLOWED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
+HTTP_UNAUTHORIZED = 401
+POWER_CLOUD_DOMAIN = "power-iaas.cloud.ibm.com"
+IAM_CLOUD_DOMAIN = "iam.cloud.ibm.com"
+
+ROUTE_DEPLOYED = "deployed"
+ROUTE_DISABLED = "disabled"
+ROUTE_UPDATING = "updating"
+ROUTE_UNKNOWN = "unknown"
+
+ROUTE_ACTIVE_STATES = {ROUTE_DEPLOYED}
+ROUTE_INACTIVE_STATES = {ROUTE_DISABLED}
+
+
+class RouteScope(Enum):
+    LOCAL = "local"
+    PEER = "peer"
+
+
+class RouteInfo:
+    def __init__(
+        self, crn, name, state, destination, advertise, next_hop, enabled, raw
+    ):
+        self.crn = crn
+        self.name = name
+        self.state = state
+        self.destination = destination
+        self.advertise = advertise
+        self.next_hop = next_hop
+        self.enabled = enabled
+        self.raw = raw
+        # Derived from crn once at construction — avoids re-parsing on every API call.
+        workspace_crn, self.route_id = crn.rsplit(":route:", 1)
+        self.ws_crn = f"{workspace_crn}::"
+
+    @classmethod
+    def from_dict(cls, d):
+        """Construct a RouteInfo from a raw API response dict."""
+        return cls(
+            crn=d["crn"],
+            name=d["name"],
+            state=d["state"].lower(),
+            destination=d["destination"],
+            advertise=d["advertise"],
+            next_hop=d["nextHop"],
+            enabled=d["enabled"],
+            raw=d,
+        )
+
+    @classmethod
+    def stub_from_crn(cls, crn):
+        """Construct a minimal RouteInfo stub from a CRN when the GET call is unavailable.
+
+        Only the crn field is populated with real data.  All other fields carry
+        neutral sentinel values so that the atomic switch-enabled path, which only
+        needs peer.crn, can proceed without error.
+        """
+        _, route_id = crn.rsplit(":route:", 1)
+        return cls(
+            crn=crn,
+            name=route_id,
+            state=ROUTE_UNKNOWN,
+            destination="",
+            advertise="",
+            next_hop="",
+            enabled=False,
+            raw={},
+        )
+
+
+class RoutePairInfo:
+    def __init__(self, local, peer):
+        self.local = local
+        self.peer = peer
+
+    def __getitem__(self, scope):
+        if scope == RouteScope.LOCAL:
+            return self.local
+        if scope == RouteScope.PEER:
+            return self.peer
+        raise KeyError(f"Unknown RouteScope: {scope!r}")
+
+    def __setitem__(self, scope, route):
+        if scope == RouteScope.LOCAL:
+            self.local = route
+        elif scope == RouteScope.PEER:
+            self.peer = route
+        else:
+            raise KeyError(f"Unknown RouteScope: {scope!r}")
+
+
+class RoutePairState(IntEnum):
+    """States describing the combined enabled/disabled status of a route pair."""
+
+    INACTIVE = 0
+    LOCAL_ROUTE_ACTIVE = 1
+    PEER_ROUTE_ACTIVE = 2
+    IN_TRANSIT = 3
+    CONFLICT = 4
+
+
+ROUTE_CRN_PATTERN = re.compile(
+    r"^crn:v1:"
+    r"(?P<env>[^:]+):"
+    r"public:"
+    r"power-iaas:"
+    r"(?P<region>[^:]+):"
+    r"a/(?P<account_id>[^:]+):"
+    r"(?P<workspace_id>[0-9a-fA-F-]{36}):"
+    r"route:"
+    r"(?P<route_id>[0-9a-fA-F-]{36})$"
+)
+
 
 sys.path.append(OCF_FUNCTIONS_DIR)
 try:
@@ -81,9 +211,13 @@ except ImportError:
 
 
 class OCFExitError(Exception):
-    """Exception class for OCF (Open Cluster Framework) exit errors."""
+    """OCF exit wrapper. Calls sys.exit() immediately on construction — never actually raises.
+
+    Subclasses are instantiated with `raise` for call-stack readability only.
+    """
 
     def __init__(self, message, exit_code):
+        self.exit_code = exit_code
         ocf.ocf_exit_reason(message)
         sys.exit(exit_code)
 
@@ -121,10 +255,9 @@ def os_cmd(cmd_args, is_json=False, is_text=False, timeout=10):
                 return parsed if parsed is not None else []
             except json.JSONDecodeError as e:
                 raise CmdError(f"os_cmd: JSON parsing failed: {e}", ocf.OCF_ERR_GENERIC)
-        elif is_text:
+        if is_text:
             return result.stdout.strip()
-        else:
-            return result.returncode
+        return result.returncode
 
     except subprocess.CalledProcessError as e:
         raise CmdError(
@@ -168,10 +301,13 @@ def ip_find_device(ip):
     return None
 
 
-def ip_check_device(device):
-    """Verify that a device with the specified interface name (device) exists."""
+def ip_check_device(device, ip):
+    """Verify that a device with the specified interface name (device) exists,
+    has the ip address assigned to it, and is UP
+    """
     for iface in ip_address_show():  # type: ignore[misc]
-        if iface["ifname"] == device and "UP" in iface["flags"]:
+        addresses = [a["local"] for a in iface["addr_info"]]
+        if iface["ifname"] == device and ip in addresses and "UP" in iface["flags"]:
             return True
 
     return False
@@ -179,11 +315,30 @@ def ip_check_device(device):
 
 def ip_alias_add(ip, device, label=None):
     """Add an IP alias to the given device."""
+
     ip_cidr = f"{ip}/{CIDR_NETMASK}"
+
+    dev = ip_find_device(ip)
+    if dev:
+        if dev != device:
+            ocf.logger.error(
+                f"[ip_alias_add]: IP alias '{ip_cidr}' "
+                f"already set on wrong interface '{dev}', instead of '{device}'"
+            )
+            raise CmdError(
+                "ip_alias_add: device configuration mismatch", ocf.OCF_ERR_CONFIGURED
+            )
+
+        ocf.logger.debug(
+            f"[ip_alias_add]: IP alias '{ip_cidr}' already set on interface '{device}'"
+        )
+        return
+
     ocf.logger.debug(
-        f"[ip_alias_add]: adding IP alias '{ip_cidr}' with label '{label}' to interface '{device}'"
+        f"[ip_alias_add]: adding IP alias '{ip_cidr}' "
+        f"with label '{label}' to interface '{device}'"
     )
-    _ = ip_address_add(ip_cidr, device, label)
+    ip_address_add(ip_cidr, device, label)
 
 
 def ip_alias_remove(ip):
@@ -192,85 +347,10 @@ def ip_alias_remove(ip):
     if device:
         ip_cidr = f"{ip}/{CIDR_NETMASK}"
         ocf.logger.debug(
-            f"[ip_alias_remove]: removing IP alias '{ip_cidr}' from interface '{device}'"
+            f"[ip_alias_remove]: removing IP alias '{ip_cidr}' "
+            f"from interface '{device}'"
         )
-        _ = ip_address_delete(ip_cidr, device)
-
-
-def crm_attribute_cmd(*args, timeout=CMD_TIMEOUT):
-    """Run crm_attribute in best-effort mode without terminating the resource agent."""
-    cmd = [CRM_ATTRIBUTE_CMD] + list(args)
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-        env={"LANG": "C"},
-    )
-
-
-def crm_attribute_set(name, value):
-    """Set a node attribute using crm_attribute.
-
-    Failure to update the status attribute is fatal because the resource agent
-    can no longer reliably track remote-route cleanup state.
-    """
-    node = ocf.get_parameter("CRM_meta_on_node")
-    ocf.logger.debug(
-        f"[crm_attribute_set]: Setting node attribute {node}:{name}={value}"
-    )
-    result = crm_attribute_cmd("--node", node, "--name", name, "--update", value)
-    if result.returncode != 0:
-        raise PowerCloudRouteError(
-            f"crm_attribute_set: failed to set node attribute {node}:{name}={value}: '{(result.stderr or '').strip()}'",
-            ocf.OCF_ERR_GENERIC,
-        )
-
-
-def crm_attribute_get(name):
-    """Get a node attribute value using crm_attribute.
-
-    Returns:
-        str: Attribute value when the attribute exists.
-        None: If the attribute is not defined or cannot be queried.
-
-    This helper is best-effort and must never terminate the resource agent.
-    """
-    node = ocf.get_parameter("CRM_meta_on_node")
-    result = crm_attribute_cmd(
-        "--node",
-        node,
-        "--name",
-        name,
-        "--query",
-        "--quiet",
-    )
-    if result.returncode == 0:
-        value = result.stdout.strip()
-        ocf.logger.debug(
-            f"[crm_attribute_get]: Found node attribute {node}:{name}={value}"
-        )
-        return value
-
-    stderr = (result.stderr or "").strip().lower()
-    if "attribute not found" in stderr or "no such device or address" in stderr:
-        return None
-
-    ocf.logger.warning(
-        f"[crm_attribute_get]: failed to query node attribute {node}:{name}: '{(result.stderr or '').strip()}'"
-    )
-    return None
-
-
-def crm_attribute_delete(name):
-    """Delete a node attribute using crm_attribute.
-
-    This helper is best-effort and must never terminate the resource agent.
-    """
-    node = ocf.get_parameter("CRM_meta_on_node")
-    ocf.logger.debug(f"[crm_attribute_delete]: Deleting node attribute {node}:{name}")
-    crm_attribute_cmd("--node", node, "--name", name, "--delete")
+        ip_address_delete(ip_cidr, device)
 
 
 def create_session_with_retries():
@@ -285,6 +365,7 @@ def create_session_with_retries():
     adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
     session = requests.Session()
     session.mount("https://", adapter)
+    session.mount("http://", adapter)
     return session
 
 
@@ -301,7 +382,7 @@ class PowerCloudTokenManager:
     _TOKEN_REFRESH_BUFFER = 900  # 15 minutes (in seconds)
     _DEFAULT_TOKEN_EXPIRY = 300  # Default token expiry (5 minutes)
     _IBMCLOUD_METADATA_ENDPOINT = "https://api.metadata.power-iaas.cloud.ibm.com"
-    _ALLOWED_PROFILE_SELECTORS = {"id", "name"}
+    _ALLOWED_PROFILE_SELECTORS = frozenset({"id", "name"})
 
     def __init__(
         self,
@@ -312,21 +393,15 @@ class PowerCloudTokenManager:
         use_cache=False,
     ):
         """Initialize PowerCloudTokenManager."""
-        # Parse authentication configuration (trusted profile or API key)
         self._use_trusted_profile, self._trusted_profile_data, self._api_key = (
             self._parse_auth_config(api_key, profile)
         )
-
-        # Determine token acquisition endpoint (only needed for API key mode)
         self._auth_url = (
             self._IBMCLOUD_METADATA_ENDPOINT
             if self._use_trusted_profile
             else self._get_auth_url(api_type)
         )
-
-        # Setup token cache if enabled
         self._cache_file = self._setup_token_cache_file() if use_cache else None
-
         self._proxy = {"https": proxy} if proxy else None
         self._session = create_session_with_retries()
 
@@ -334,7 +409,7 @@ class PowerCloudTokenManager:
     def _get_auth_url(api_type):
         """Determine IAM token endpoint based on API type."""
         iam_subdomain = "private." if api_type == "private" else ""
-        return f"https://{iam_subdomain}iam.cloud.ibm.com/identity/token"
+        return f"https://{iam_subdomain}{IAM_CLOUD_DOMAIN}/identity/token"
 
     def _parse_auth_config(self, api_key, profile):
         """Parse authentication configuration from api_key and profile parameters.
@@ -355,7 +430,6 @@ class PowerCloudTokenManager:
         api_key_str = str(api_key).strip() if api_key else ""
         profile_str = str(profile).strip() if profile else ""
 
-        # Trusted profile mode via identity token
         if api_key_str.lower() == "identity_token":
             if not profile_str:
                 return True, {}, None
@@ -366,11 +440,8 @@ class PowerCloudTokenManager:
                     f"Valid formats: 'id:VALUE', 'name:VALUE'",
                     ocf.OCF_ERR_CONFIGURED,
                 )
-
             prefix, _, value = profile_str.partition(":")
-            prefix_lower = prefix.lower()
             value = value.strip()
-
             if not value:
                 raise PowerCloudTokenManagerError(
                     f"_parse_auth_config: Empty value in trusted profile selector: '{profile_str}'. "
@@ -378,6 +449,7 @@ class PowerCloudTokenManager:
                     ocf.OCF_ERR_CONFIGURED,
                 )
 
+            prefix_lower = prefix.lower()
             if prefix_lower in self._ALLOWED_PROFILE_SELECTORS:
                 return True, {"trusted_profile": {prefix_lower: value}}, None
 
@@ -387,9 +459,7 @@ class PowerCloudTokenManager:
                 ocf.OCF_ERR_CONFIGURED,
             )
 
-        # Not trusted profile mode - load API key (handles @file or plain key)
-        loaded_key = self._load_api_key(api_key)
-        return False, {}, loaded_key
+        return False, {}, self._load_api_key(api_key)
 
     def _load_api_key(self, api_key):
         """Load API key from string or file (@path supports raw or JSON with 'apikey')."""
@@ -398,22 +468,27 @@ class PowerCloudTokenManager:
                 "_load_api_key: API key is missing",
                 ocf.OCF_ERR_CONFIGURED,
             )
-        # API key passed as plain string
         if not api_key.startswith("@"):
             return api_key
 
-        # API key provided via file path (after '@')
         api_key_path = Path(api_key[1:])
         if not api_key_path.is_file():
             raise PowerCloudTokenManagerError(
                 f"_load_api_key: API key file not found: '{api_key_path}'",
                 ocf.OCF_ERR_ARGS,
             )
+
+        mode = stat.S_IMODE(api_key_path.stat().st_mode)
+        if mode & 0o077:
+            raise PowerCloudTokenManagerError(
+                f"_load_api_key: insecure permissions on API key file '{api_key_path}'",
+                ocf.OCF_ERR_ARGS,
+            )
+
         content = api_key_path.read_text().strip()
         try:
             api_key_field = json.loads(content).get("apikey", "")
         except json.JSONDecodeError:
-            # Data is plain text; return as is
             api_key_field = content
 
         if not api_key_field:
@@ -437,7 +512,7 @@ class PowerCloudTokenManager:
         }
         data = {
             "grant_type": "urn:ibm:params:oauth:grant-type:apikey",
-            "apikey": f"{self._api_key}",
+            "apikey": self._api_key,
         }
         current_time = time.monotonic()
         try:
@@ -456,7 +531,8 @@ class PowerCloudTokenManager:
             )
         except requests.RequestException as e:
             ocf.logger.warning(
-                f"[PowerCloudTokenManager] _request_bearer_token_by_apikey: failed to request token: '{e}'"
+                "[PowerCloudTokenManager] _request_bearer_token_by_apikey: "
+                f"failed to request token: '{e}'"
             )
             return None
 
@@ -467,7 +543,7 @@ class PowerCloudTokenManager:
             url,
             headers=headers,
             json=json,
-            proxies=None,  # never proxy metadata service
+            proxies=None,
             timeout=REQUESTS_TIMEOUT,
         )
         response.raise_for_status()
@@ -483,18 +559,20 @@ class PowerCloudTokenManager:
                 "PUT",
                 identity_url,
                 identity_headers,
-                json={},  # Empty body uses default expires_in (300 seconds)
+                json={},
             )
             identity_token = identity_data.get("access_token")
             if not identity_token:
                 ocf.logger.warning(
-                    "[PowerCloudTokenManager] _request_identity_token: identity token missing in response"
+                    "[PowerCloudTokenManager] _request_identity_token: "
+                    "identity token missing in response"
                 )
                 return None
             return identity_token
         except requests.RequestException as e:
             ocf.logger.warning(
-                f"[PowerCloudTokenManager] _request_identity_token: failed to obtain identity token: '{e}'"
+                "[PowerCloudTokenManager] _request_identity_token: "
+                f"failed to obtain identity token: '{e}'"
             )
             return None
 
@@ -505,27 +583,22 @@ class PowerCloudTokenManager:
         Returns:
             tuple: (access_token, expiry_time) or None if the request fails.
         """
-        # Step 1: Request a new identity service token.
         identity_token = self._request_identity_token()
         if not identity_token:
             return None
 
-        # Step 2: Exchange the identity token for a bearer token.
         iam_token_url = f"{self._auth_url}/identity/v1/iam_tokens"
         iam_token_headers = {
             "Authorization": f"Bearer {identity_token}",
             "Metadata-Flavor": "ibm",
         }
-        # Use the trusted profile data dict directly (empty dict for default profile)
-        iam_token_data = self._trusted_profile_data
-
         current_time = time.monotonic()
         try:
             token_data = self._identity_service_request(
                 "POST",
                 iam_token_url,
                 iam_token_headers,
-                json=iam_token_data,
+                json=self._trusted_profile_data,
             )
             expires_in = int(token_data.get("expires_in", self._DEFAULT_TOKEN_EXPIRY))
             return (
@@ -534,20 +607,22 @@ class PowerCloudTokenManager:
             )
         except requests.RequestException as e:
             ocf.logger.warning(
-                f"[PowerCloudTokenManager] _request_bearer_token_by_identity: failed to request bearer token: '{e}'"
+                "[PowerCloudTokenManager] _request_bearer_token_by_identity: "
+                f"failed to request bearer token: '{e}'"
             )
             return None
 
     def _setup_token_cache_file(self):
         """Create a token cache file with secure permissions and return a Path object."""
-        resource_instance = OCF_RESOURCE_INSTANCE
         cache_file = Path(
-            f"@HA_VARRUNDIR@/resource-agents/{resource_instance}-token.json"
+            f"@HA_VARRUNDIR@/resource-agents/{OCF_RESOURCE_INSTANCE}-token.json"
         )
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        if not cache_file.exists():
-            cache_file.touch()
-            os.chmod(cache_file, 0o600)
+        try:
+            fd = os.open(cache_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            pass
         return cache_file
 
     def _read_cache(self):
@@ -556,14 +631,18 @@ class PowerCloudTokenManager:
             return {}
         try:
             with self._cache_file.open("r") as f:
-                fcntl.flock(f, fcntl.LOCK_SH)  # Shared lock for reading
+                fcntl.flock(f, fcntl.LOCK_SH)
                 try:
-                    return json.load(f)
+                    content = f.read().strip()
+                    if not content:
+                        return {}
+                    return json.loads(content)
                 finally:
                     fcntl.flock(f, fcntl.LOCK_UN)
         except (json.JSONDecodeError, FileNotFoundError, PermissionError) as e:
             ocf.logger.warning(
-                f"[PowerCloudTokenManager] _read_cache: failed to read token cache read due to missing file or malformed JSON: '{e}'"
+                "[PowerCloudTokenManager] _read_cache: failed to read token "
+                f"cache due to missing file or malformed JSON: '{e}'"
             )
             return {}
 
@@ -571,20 +650,15 @@ class PowerCloudTokenManager:
         """Write token cache."""
         if self._cache_file is None:
             return
+        data = json.dumps({"token": token, "expiration": expiration})
+        fd, tmp_path = tempfile.mkstemp(dir=self._cache_file.parent)
         try:
-            with self._cache_file.open("w") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                try:
-                    json.dump(
-                        {
-                            "token": token,
-                            "expiration": expiration,
-                        },
-                        f,
-                    )
-                finally:
-                    fcntl.flock(f, fcntl.LOCK_UN)
-        except Exception as e:
+            with os.fdopen(fd, "w") as f:
+                os.fchmod(f.fileno(), 0o600)
+                f.write(data)
+            Path(tmp_path).replace(self._cache_file)
+        except OSError as e:
+            Path(tmp_path).unlink(missing_ok=True)
             raise PowerCloudTokenManagerError(
                 f"_write_cache: failed to write token cache file: '{e}'",
                 ocf.OCF_ERR_GENERIC,
@@ -595,9 +669,7 @@ class PowerCloudTokenManager:
         return time.monotonic() + self._TOKEN_REFRESH_BUFFER >= expiration
 
     def get_token(self):
-        """
-        Get a valid access token, using cache if enabled. Returns a bearer token."""
-        # No cache -> always fetch fresh
+        """Get a valid access token, using cache if enabled. Returns a bearer token."""
         if not self._cache_file:
             result = self._request_new_token()
             if result:
@@ -608,7 +680,6 @@ class PowerCloudTokenManager:
                 ocf.OCF_ERR_GENERIC,
             )
 
-        # Cached mode
         cache = self._read_cache()
         token = cache.get("token")
         expiration = cache.get("expiration", 0)
@@ -645,32 +716,28 @@ class PowerCloudAPIError(OCFExitError):
 class PowerCloudAPI:
     """Offers a convenient method for sending requests to the IBM Power Cloud API."""
 
-    _ALLOWED_API_TYPES = {"public", "private"}
+    _ALLOWED_API_TYPES = frozenset({"public", "private"})
 
     def __init__(
         self,
         api_key="",
         api_type="",
         region="",
-        crn="",
         proxy="",
         profile="",
         use_cache=False,
     ):
-        """Initialize class variables, including the IBM Power Cloud API endpoint URL and HTTP header, and get an API token."""
-
-        self._crn = crn
+        """Initialize PowerCloudAPI: resolve endpoint URL, obtain a bearer token, and create an HTTP session."""
         self._proxy = self._get_proxy(proxy)
         self._api_url = self._get_api_url(region, api_type)
-        token_manager = PowerCloudTokenManager(
+        self._token_manager = PowerCloudTokenManager(
             api_type=api_type,
             api_key=api_key,
             proxy=proxy,
             profile=profile,
             use_cache=use_cache,
         )
-        self._token = token_manager.get_token()
-        self._header = self._get_header()
+        self._token = self._token_manager.get_token()
         self._session = create_session_with_retries()
 
     def _get_proxy(self, proxy):
@@ -693,9 +760,9 @@ class PowerCloudAPI:
 
         try:
             with socket.create_connection(
-                (parsed_url.hostname, parsed_url.port), timeout=REQUESTS_TIMEOUT
+                (parsed_url.hostname, parsed_url.port), timeout=REQUESTS_CONNECT_TIMEOUT
             ):
-                return {"https": proxy}
+                return {"http": proxy, "https": proxy}
         except OSError as e:
             raise PowerCloudAPIError(
                 f"_get_proxy: cannot connect to proxy '{proxy}': {e}",
@@ -703,7 +770,8 @@ class PowerCloudAPI:
             )
 
     def _get_api_url(self, region, api_type):
-        """Generate and return the API URL for a given region and API type."""
+        """Build and return the PowerVS API base URL for the given region and API type."""
+
         if not region:
             raise PowerCloudAPIError(
                 "_get_api_url: missing region parameter",
@@ -713,7 +781,7 @@ class PowerCloudAPI:
         api_type = str(api_type).lower()
         if api_type not in self._ALLOWED_API_TYPES:
             raise PowerCloudAPIError(
-                f"_get_api_url: invalid api_type: '{api_type}', must be one of {self._ALLOWED_API_TYPES} ",
+                f"_get_api_url: invalid api_type: '{api_type}', must be one of {self._ALLOWED_API_TYPES}",
                 ocf.OCF_ERR_CONFIGURED,
             )
         if api_type == "public" and not self._proxy:
@@ -723,54 +791,81 @@ class PowerCloudAPI:
             )
 
         subdomain = "private." if api_type == "private" else ""
-        return f"https://{subdomain}{region}.power-iaas.cloud.ibm.com"
+        return f"https://{subdomain}{region}.{POWER_CLOUD_DOMAIN}"
 
-    def _get_header(self):
-        """Construct request header."""
+    def _refresh_token(self):
+        """Refresh the bearer token by requesting a new one from the token manager."""
+        self._token = self._token_manager.get_token()
+
+    def _get_header(self, crn=""):
+        """Construct request header, with an optional per-request CRN override."""
         return {
             "Authorization": f"Bearer {self._token}",
-            "CRN": self._crn,
+            "CRN": crn,
             "Content-Type": "application/json",
         }
 
-    def send_api_request(self, method, resource, **kwargs):
-        """Perform an HTTP API call to the specified resource using the given method"""
+    def send_request(self, method, resource, crn="", json=None):
+        """Perform an HTTP API call to the specified resource using the given method.
+
+        The workspace CRN must be supplied via the ``crn`` argument so that the
+        correct ``CRN`` header is set for each request.
+        """
         url = f"{self._api_url}{resource}"
+        parts = crn.split(":") if crn else []
+        workspace_id = parts[7] if len(parts) > 7 else ""
+
         method = method.upper()
-        ocf.logger.debug(f"[PowerCloudAPI] send_api_request: '{method}' '{resource}'")
+
+        ocf.logger.debug(
+            f"[PowerCloudAPI] send_request: '{method}' '{resource}' "
+            f"(workspace '{workspace_id}')"
+        )
 
         try:
-            response = self._session.request(
-                method,
-                url,
-                headers=self._header,
-                proxies=self._proxy,
-                timeout=REQUESTS_TIMEOUT,
-                **kwargs,
+            request_timeout = (
+                REQUESTS_TIMEOUT_WRITE
+                if method in {"PUT", "POST"}
+                else REQUESTS_TIMEOUT
             )
+            for attempt in range(2):
+                response = self._session.request(
+                    method,
+                    url,
+                    headers=self._get_header(crn),
+                    proxies=self._proxy,
+                    timeout=request_timeout,
+                    json=json,
+                )
+                if response.status_code != HTTP_UNAUTHORIZED:
+                    break
+
+                if attempt == 0:
+                    ocf.logger.warning(
+                        f"[PowerCloudAPI] send_request: '{method}' '{resource}' failed: "
+                        f"'{response.status_code}', try to refresh token."
+                    )
+                    self._refresh_token()
+
             response.raise_for_status()
             return response.json()
+
         except requests.RequestException as e:
             raise PowerCloudAPIError(
-                f"send_api_request: request error occurred: '{method}' - '{resource}' - '{e}'",
+                f"send_request: request error occurred: '{method}' - '{resource}' - '{e}'",
                 ocf.OCF_ERR_GENERIC,
             )
 
 
-class PowerCloudRouteError(OCFExitError):
+class RoutePairError(OCFExitError):
     """Exception class for errors encountered while managing PowerVS network routes."""
 
     def __init__(self, message, exit_code):
-        super().__init__(f"[PowerCloudRouteError] {message}", exit_code)
+        super().__init__(f"[RoutePairError] {message}", exit_code)
 
 
-class PowerCloudRoute:
-    """Provides methods for managing network routes in Power Virtual Server."""
-
-    _CRN_PREFIX_INDEX = 0
-    _CRN_TYPE_INDEX = 8
-    _CRN_ROUTE_ID_INDEX = 9
-    _CRN_EXPECTED_LENGTH = 10
+class RoutePair:
+    """Provides methods for managing a pair of network routes in Power Virtual Server."""
 
     def __init__(
         self,
@@ -779,267 +874,429 @@ class PowerCloudRoute:
         api_type="",
         region="",
         route_host_map="",
+        use_token_cache="",
         device="",
         iflabel="",
         proxy="",
         profile="",
+        atomic="",
         monitor_api="",
-        use_token_cache="",
-        is_remote_route=False,
     ):
-        """Initialize PowerCloudRoute instance."""
-        self._is_remote_route = is_remote_route
-        self.ip = self._get_ip_info(ip)
-        self.crn, self.route_id = self._parse_route_map(route_host_map)
-        use_cache = str(use_token_cache).lower() == "true"
+        """Initialize RoutePair instance."""
+        local_crn, peer_crn = self._parse_route_map(route_host_map)
+
         self._api = PowerCloudAPI(
             api_key=api_key,
             api_type=api_type,
             region=region,
-            crn=self.crn,
             proxy=proxy,
             profile=profile,
-            use_cache=use_cache,
+            use_cache=str(use_token_cache).lower() == "true",
         )
-        self.route_info = self._get_route_info()
-        self.route_name = self.route_info["name"]
+
+        self._atomic = str(atomic).lower() == "true"
+        self._ip = self._get_ip_info(ip)
+
+        self.routes = RoutePairInfo(
+            local=self._get_route_info(local_crn),
+            peer=self._get_peer_route_info(peer_crn),
+        )
+
         self.device = self._get_device_name(device)
         self.iflabel = self._make_iflabel(iflabel)
+
+        self.name = f"({self.routes.local.name}, {self.routes.peer.name})"
+
+    def refresh(self, scope=None):
+        """Update the route information for the local route, the peer route, or both."""
+        scopes = (scope,) if scope is not None else RouteScope
+
+        for route_scope in scopes:
+            self.routes[route_scope] = self._refresh_route_info(route_scope)
+
+    def _get_route_info(self, crn):
+        """Retrieve and validate attributes of a PowerVS network route."""
+        ws_crn, route_id = crn.rsplit(":route:", 1)
+        ws_crn = f"{ws_crn}::"
+
+        route_info = self._api.send_request(
+            "GET",
+            f"/v1/routes/{route_id}",
+            crn=ws_crn,
+        )
+
+        ocf.logger.debug(f"[RoutePair] _get_route_info: '{route_info}'")
+
+        if self._ip != route_info["destination"]:
+            raise RoutePairError(
+                f"_get_route_info: IP '{self._ip}' does not match "
+                f"the route destination address "
+                f"'{route_info['destination']}'",
+                ocf.OCF_ERR_CONFIGURED,
+            )
+
+        if route_info["advertise"] != "enable":
+            raise RoutePairError(
+                f"_get_route_info: route '{route_info['name']}' "
+                f"advertise flag must be set to enable",
+                ocf.OCF_ERR_CONFIGURED,
+            )
+
+        return RouteInfo.from_dict(route_info)
+
+    def _get_peer_route_info(self, peer_crn):
+        """Retrieve and validate attributes of the peer PowerVS network route.
+
+        When atomic=True, a failure of the GET call is tolerated: the peer route
+        data is not required for the switch-enabled POST, which only needs
+        peer.crn.  In that case a stub RouteInfo built from the CRN is returned
+        and a warning is logged.  When atomic=False the failure is an error, as
+        the non-atomic path issues individual PUT calls that depend on full peer
+        route state.
+        """
+        try:
+            return self._get_route_info(peer_crn)
+        except SystemExit:
+            # OCFExitError subclasses call sys.exit() on construction, which
+            # raises SystemExit.  Catching it here is intentional: it lets the
+            # atomic path tolerate a failing peer-route GET while re-raising
+            # immediately on the non-atomic path where full peer state is needed.
+            if not self._atomic:
+                raise
+            ocf.logger.warning(
+                f"[RoutePair] _get_peer_route_info: failed to retrieve peer route "
+                f"'{peer_crn}'; continuing with stub because atomic=True"
+            )
+            return RouteInfo.stub_from_crn(peer_crn)
+
+    def _refresh_route_info(self, scope):
+        """Update route info."""
+        route = self.routes[scope]
+
+        route_info = self._api.send_request(
+            "GET",
+            f"/v1/routes/{route.route_id}",
+            crn=route.ws_crn,
+        )
+        ocf.logger.debug(f"[RoutePair] _refresh_route_info: '{route_info}'")
+        return RouteInfo.from_dict(route_info)
+
+    def _set_route_enabled(self, scope, enabled):
+        """Change route state."""
+        route = self.routes[scope]
+
+        state = "enabled" if enabled else "disabled"
+        ocf.logger.debug(
+            f"[RoutePair] _set_route_enabled: update route '{route.name}' to '{state}'"
+        )
+
+        self._api.send_request(
+            "PUT",
+            f"/v1/routes/{route.route_id}",
+            crn=route.ws_crn,
+            json={"enabled": enabled},
+        )
+
+    def is_enabled(self, scope):
+        """Verify if route is enabled."""
+        return self.routes[scope].state in ROUTE_ACTIVE_STATES
+
+    def is_disabled(self, scope):
+        """Verify if route is disabled."""
+        return self.routes[scope].state in ROUTE_INACTIVE_STATES
 
     def _get_ip_info(self, ip):
         """Validate the given IP address and return its standard form."""
         try:
             return str(ipaddress.ip_address(ip))
         except ValueError:
-            raise PowerCloudRouteError(
+            raise RoutePairError(
                 f"_get_ip_info: invalid IP address '{ip}'",
                 ocf.OCF_ERR_CONFIGURED,
             )
 
-    def _parse_route_crn(self, route_crn):
-        """Parses a PowerVS route CRN and extract its base CRN and route ID."""
-        crn_parts = route_crn.split(":")
+    def switch_enable(self):
+        """Enable the local route, and disable the peer route."""
+        local = self.routes.local
+        peer = self.routes.peer
 
-        if (
-            len(crn_parts) != self._CRN_EXPECTED_LENGTH
-            or crn_parts[self._CRN_PREFIX_INDEX] != "crn"
-            or crn_parts[self._CRN_TYPE_INDEX] != "route"
-        ):
-            raise PowerCloudAPIError(
-                f"_parse_route_crn: invalid CRN format for network-route: '{route_crn}'",
-                ocf.OCF_ERR_CONFIGURED,
+        if self._atomic:
+            ocf.logger.debug(
+                f"[RoutePair] switch_enable: atomically enable "
+                f"local route '{local.name}' and disable "
+                f"peer route '{peer.name}'"
             )
 
-        workspace_crn = ":".join(crn_parts[: self._CRN_TYPE_INDEX]) + "::"
-        route_id = crn_parts[self._CRN_ROUTE_ID_INDEX]
-
-        return workspace_crn, route_id
-
-    def _parse_route_map(self, route_host_map):
-        """Validate the route host map and extract the associated CRN and route ID."""
-        try:
-            route_map = dict(item.split(":", 1) for item in route_host_map.split(";"))
-        except ValueError:
-            raise PowerCloudRouteError(
-                f"_parse_route_map: invalid route_host_map format: '{route_host_map}'",
-                ocf.OCF_ERR_CONFIGURED,
+            self._api.send_request(
+                "POST",
+                f"/v1/routes/{local.route_id}/switch-enabled",
+                crn=local.ws_crn,
+                json={"disabledRouteCRN": peer.crn},
             )
+            return
 
-        if len(route_map) != 2:
-            raise PowerCloudRouteError(
-                f"_parse_route_map: expected exactly two entries in route_host_map, got {len(route_map)}: '{route_host_map}'",
-                ocf.OCF_ERR_CONFIGURED,
-            )
-
-        hostname = os.uname().nodename
-        # Mandatory check: local hostname must be present in route_map
-        if hostname not in route_map:
-            raise PowerCloudRouteError(
-                f"_parse_route_map: hostname '{hostname}' not found in route_host_map '{route_host_map}'",
-                ocf.OCF_ERR_CONFIGURED,
-            )
-
-        # For a remote route: Set nodename to the hostname in the route_map,
-        # for a local route set nodename to the local hostname
-        nodename = (
-            next((host for host in route_map if host != hostname), None)
-            if self._is_remote_route
-            else hostname
-        )
-
-        if not nodename or nodename not in route_map:
-            raise PowerCloudRouteError(
-                f"_parse_route_map: hostname '{nodename}' not found in route_host_map '{route_host_map}'",
-                ocf.OCF_ERR_CONFIGURED,
-            )
-
-        return self._parse_route_crn(route_map[nodename])
-
-    def _get_route_info(self):
-        """Retrieve and validate attributes of a PowerVS network route."""
-        resource = f"/v1/routes/{self.route_id}"
-        route_info = self._api.send_api_request("GET", resource)
-
-        zone = "remote" if self._is_remote_route else "local"
         ocf.logger.debug(
-            f"[PowerCloudRoute] _get_route_info: {zone} route info: '{route_info}'"
+            f"[RoutePair] switch_enable: "
+            f"disable peer route '{peer.name}', and "
+            f"enable local route '{local.name}'"
         )
+        self.disable_route(RouteScope.PEER)
+        self.enable_route(RouteScope.LOCAL)
 
-        if self.ip != route_info["destination"]:
-            raise PowerCloudRouteError(
-                f"_get_route_info: IP '{self.ip}' does not match the route destination address '{route_info['destination']}'",
-                ocf.OCF_ERR_CONFIGURED,
+    def get_state(self):
+        """Get the route state."""
+        local = self.routes.local.state
+        peer = self.routes.peer.state
+
+        if local == ROUTE_UPDATING or peer == ROUTE_UPDATING:
+            return RoutePairState.IN_TRANSIT, f"is transitioning ({local}, {peer})"
+
+        if local == ROUTE_DEPLOYED:
+            if peer == ROUTE_DISABLED or peer == ROUTE_UNKNOWN:
+                return (
+                    RoutePairState.LOCAL_ROUTE_ACTIVE,
+                    "has the local route active",
+                )
+            return (
+                RoutePairState.CONFLICT,
+                f"has a conflicting state: ({local}, {peer})",
             )
+        if local == ROUTE_DISABLED:
+            if peer == ROUTE_DISABLED:
+                return RoutePairState.INACTIVE, "has both routes inactive"
+            if peer == ROUTE_DEPLOYED:
+                return (
+                    RoutePairState.PEER_ROUTE_ACTIVE,
+                    "has the peer route active",
+                )
+            if peer == ROUTE_UNKNOWN:
+                return RoutePairState.INACTIVE, "has local route inactive"
 
-        if route_info["advertise"] != "enable":
-            raise PowerCloudRouteError(
-                f"_get_route_info: route '{route_info['name']}' advertise flag must be set to enable",
-                ocf.OCF_ERR_CONFIGURED,
-            )
+        return RoutePairState.CONFLICT, f"has a conflicting state: ({local}, {peer})"
 
-        return route_info
+    def enable_route(self, scope):
+        """Enable the PowerVS network route."""
+        if not self.is_enabled(scope):
+            self._set_route_enabled(scope, True)
+
+    def disable_route(self, scope):
+        """Disable the PowerVS network route."""
+        if not self.is_disabled(scope):
+            self._set_route_enabled(scope, False)
+
+    def disable_local(self):
+        """Disable the local route."""
+        self.disable_route(RouteScope.LOCAL)
+
+    def enable_local(self):
+        """Enable the local route."""
+        self.enable_route(RouteScope.LOCAL)
 
     def _get_device_name(self, name):
         """Verify the existence of a network interface with the specified name."""
-        if self._is_remote_route:
-            return ""
 
+        next_hop = self.routes.local.next_hop
         if name:
-            if ip_check_device(name):
+            if ip_check_device(name, next_hop):
                 return name
-            raise PowerCloudRouteError(
-                f"_get_device_name: network interface '{name}' does not exist or is down",
+            raise RoutePairError(
+                f"_get_device_name: network interface '{name}' does not exist, "
+                f" is down, or does not match with IP address '{next_hop}'",
                 ocf.OCF_ERR_CONFIGURED,
             )
 
-        next_hop = self.route_info["nextHop"]
         interface_name = ip_find_device(next_hop)
         if interface_name:
             return interface_name
 
-        raise PowerCloudRouteError(
+        raise RoutePairError(
             f"_get_device_name: network interface with next hop '{next_hop}' does not exist or is down",
             ocf.OCF_ERR_CONFIGURED,
         )
 
+    def _parse_route_map(self, route_host_map):
+        """Return (local_crn, peer_crn) from route_host_map."""
+        entries = route_host_map.split(";")
+
+        if len(entries) != 2:
+            raise RoutePairError(
+                f"Expected exactly two entries in route_host_map: '{route_host_map}'",
+                ocf.OCF_ERR_CONFIGURED,
+            )
+
+        host_to_crn = {}
+
+        for entry in entries:
+            parts = entry.split(":", 1)
+            if len(parts) != 2:
+                raise RoutePairError(
+                    f"Invalid route_host_map entry: '{entry}'",
+                    ocf.OCF_ERR_CONFIGURED,
+                )
+            hostname, crn = parts[0].strip("'\""), parts[1].strip("'\"")
+
+            if hostname in host_to_crn:
+                raise RoutePairError(
+                    f"Duplicate hostname '{hostname}' in route_host_map",
+                    ocf.OCF_ERR_CONFIGURED,
+                )
+
+            if not self._is_valid_route_crn(crn):
+                raise RoutePairError(
+                    f"Invalid CRN for hostname '{hostname}': '{crn}'",
+                    ocf.OCF_ERR_CONFIGURED,
+                )
+
+            host_to_crn[hostname] = crn
+
+        local_hostname = os.uname().nodename
+
+        try:
+            local_crn = host_to_crn[local_hostname]
+        except KeyError:
+            raise RoutePairError(
+                f"Local hostname '{local_hostname}' not found in route_host_map",
+                ocf.OCF_ERR_CONFIGURED,
+            )
+
+        peer_hostname = next(
+            hostname for hostname in host_to_crn if hostname != local_hostname
+        )
+
+        return local_crn, host_to_crn[peer_hostname]
+
     def _make_iflabel(self, label=None):
         """Constructs an interface label in the format 'device:label' if both are provided."""
-        if not label or self._is_remote_route:
+        if not label:
             return None
 
         iflabel = f"{self.device}:{label}"
 
         if len(iflabel) > IFLABEL_MAX_LEN:
-            raise PowerCloudRouteError(
+            raise RoutePairError(
                 f"_make_iflabel: interface label '{iflabel}' exceeds limit of {IFLABEL_MAX_LEN} characters",
                 ocf.OCF_ERR_CONFIGURED,
             )
 
         return iflabel
 
-    def _set_route_enabled(self, enabled):
-        """Enable or disable the PowerVS network route."""
-        resource = f"/v1/routes/{self.route_id}"
-        data = json.dumps({"enabled": enabled})
+    def _is_valid_route_crn(self, route_crn):
+        """
+        Validate that the CRN is a PowerVS route CRN.
+        """
+        return bool(ROUTE_CRN_PATTERN.match(route_crn))
 
-        state = "enabled" if enabled else "disabled"
-        response = self._api.send_api_request("PUT", resource, data=data)
-        ocf.logger.debug(
-            f"[PowerCloudRoute] _set_route_enabled: successfully {state} route '{self.route_name}', response: '{response}'"
-        )
+    def wait_until_deployed(self, deadline):
+        """Wait until the local route reaches the deployed state.
 
-    def is_enabled(self):
-        """Check whether the PowerVS network route is currently enabled."""
-        return self.route_info["state"] == "deployed"
+        Args:
+            deadline (float): Absolute monotonic time (seconds) by which the
+                route must be deployed.  The loop stops
+                RESOURCE_AGENT_TIMEOUT_BUFFER seconds before this value so
+                that the caller has time to perform any cleanup before the
+                Pacemaker operation timeout fires.
 
-    def enable(self):
-        """Enable the PowerVS network route."""
-        if not self.is_enabled():
-            self._set_route_enabled(True)
+        Raises:
+            RoutePairError: If the deadline is reached before the route is deployed.
+        """
+        soft_deadline = deadline - RESOURCE_AGENT_TIMEOUT_BUFFER
 
-    def disable(self):
-        """Disable the PowerVS network route."""
-        if self.is_enabled():
-            self._set_route_enabled(False)
+        while time.monotonic() < soft_deadline:
+            try:
+                self.refresh(RouteScope.LOCAL)
+            except SystemExit:
+                # OCFExitError subclasses call sys.exit(), which raises
+                # SystemExit.  A transient API failure during the polling loop
+                # should not abort the wait — log the failure and retry until
+                # the deadline is reached.
+                ocf.logger.warning(
+                    f"[RoutePair] wait_until_deployed: refresh failed; will retry"
+                )
+                time.sleep(ROUTE_POLL_INTERVAL)
+                continue
 
+            if self.routes.local.state in ROUTE_ACTIVE_STATES:
+                ocf.logger.debug(
+                    f"[RoutePair] wait_until_deployed: "
+                    f"success for local route '{self.routes.local.name}'"
+                )
+                return
 
-def _create_route_instance(
-    resource_options, is_remote_route=False, catch_exception=False
-):
-    """Instantiate a PowerCloudRoute object and handle errors."""
-    try:
-        return PowerCloudRoute(**resource_options, is_remote_route=is_remote_route)
-    except (Exception, SystemExit) as e:
-        zone = "remote" if is_remote_route else "local"
-        error_info = f"exit code: {e.code}" if isinstance(e, SystemExit) else str(e)
-        log_fn = ocf.logger.warning if catch_exception else ocf.logger.error
-        log_fn(
-            f"[_create_route_instance]: failed to instantiate {zone} route ({error_info})"
-        )
-        if catch_exception:
-            return None
-        raise
-
-
-def _disable_route(route, is_remote=False):
-    """Disable a PowerVS network route."""
-    zone = "remote" if is_remote else "local"
-    ocf.logger.debug(f"[_disable_route]: disabling {zone} route '{route.route_name}'")
-    route.disable()
-
-
-def _enable_route(route, is_remote=False):
-    """Enable a PowerVS network route."""
-    zone = "remote" if is_remote else "local"
-    ocf.logger.debug(f"[_enable_route]: enabling {zone} route '{route.route_name}'")
-    route.enable()
-
-
-def _attempt_remote_route_disable(resource_options):
-    """Best-effort remote-route cleanup with node-attribute state tracking.
-
-    This helper attempts to instantiate the remote route and disable it. The
-    outcome is written to CRM_ATTR_REMOTE_ROUTE_STATUS so later monitor actions
-    can decide whether another cleanup attempt is needed.
-
-    Behavior:
-    - if the remote route cannot be instantiated, the attribute is set to
-      UNKNOWN
-    - if the remote route is disabled successfully, the attribute is deleted
-    - if disabling the remote route raises an error, the attribute is set to
-      UNKNOWN
-
-    Remote-route handling errors are non-fatal by design. This helper must not
-    fail the resource action directly; it records cleanup status for best-effort
-    recovery by subsequent monitor operations.
-    """
-    remote_route = _create_route_instance(
-        resource_options, is_remote_route=True, catch_exception=True
-    )
-
-    if remote_route is None:
-        ocf.logger.warning(
-            f"[_attempt_remote_route_disable]: remote route is None, setting {CRM_ATTR_REMOTE_ROUTE_STATUS}=UNKNOWN"
-        )
-        crm_attribute_set(CRM_ATTR_REMOTE_ROUTE_STATUS, "UNKNOWN")
-    else:
-        ocf.logger.debug(
-            f"[_attempt_remote_route_disable]: remote route '{remote_route.route_name}' instantiated, attempting disable"
-        )
-        try:
-            _disable_route(remote_route, is_remote=True)
-            if crm_attribute_get(CRM_ATTR_REMOTE_ROUTE_STATUS) is not None:
-                crm_attribute_delete(CRM_ATTR_REMOTE_ROUTE_STATUS)
-        except (Exception, SystemExit) as e:
-            ocf.logger.warning(
-                f"[_attempt_remote_route_disable]: failed to disable remote route: '{e}', setting {CRM_ATTR_REMOTE_ROUTE_STATUS}=UNKNOWN"
+            ocf.logger.debug(
+                f"[RoutePair] wait_until_deployed: "
+                f"waiting for local route '{self.routes.local.name}' "
+                f"(current state: '{self.routes.local.state}')"
             )
-            crm_attribute_set(CRM_ATTR_REMOTE_ROUTE_STATUS, "UNKNOWN")
+            time.sleep(ROUTE_POLL_INTERVAL)
+
+        raise RoutePairError(
+            f"wait_until_deployed: timed out waiting for "
+            f"local route '{self.routes.local.name}' to reach state 'deployed' "
+            f"(current state: '{self.routes.local.state}')",
+            ocf.OCF_ERR_GENERIC,
+        )
 
 
-def _filter_resource_options(**kwargs):
-    """Filter kwargs to only include keys defined in RESOURCE_AGENT_OPTIONS."""
-    return {k: v for k, v in kwargs.items() if k in RESOURCE_AGENT_OPTIONS}
+def _filter_resource_options(local_vars):
+    """Return a dict restricted to keys defined in RESOURCE_AGENT_OPTIONS.
+
+    NOTE: RESOURCE_AGENT_OPTIONS must be kept in sync with the add_parameter()
+    calls in main() and with the parameter signatures of all action functions.
+    """
+    return {k: v for k, v in local_vars.items() if k in RESOURCE_AGENT_OPTIONS}
+
+
+def monitor_route_pair(route_pair, ip):
+    """Validates the consistency of the local resource state
+    - checking the local IP alias
+    - checking the local route, and the peer route.
+    """
+
+    ip_alias_present = ip_find_device(ip) is not None
+
+    state, state_info = route_pair.get_state()
+
+    if state == RoutePairState.IN_TRANSIT:
+        ocf.logger.debug(
+            f"[monitor_route_pair]: Route pair '{route_pair.name}' {state_info}"
+        )
+        if ip_alias_present:
+            return ocf.OCF_SUCCESS
+        else:
+            return ocf.OCF_NOT_RUNNING
+
+    if state == RoutePairState.INACTIVE:
+        if ip_alias_present:
+            ocf.logger.debug(
+                f"[monitor_route_pair]: Route pair '{route_pair.name}' "
+                f"{state_info}, but IP alias '{ip}' is active"
+            )
+            return ocf.OCF_ERR_GENERIC
+        ocf.logger.debug(
+            f"[monitor_route_pair]: IP alias '{ip}' is not active, "
+            f"and route pair '{route_pair.name}' {state_info}"
+        )
+        return ocf.OCF_NOT_RUNNING
+
+    if state == RoutePairState.LOCAL_ROUTE_ACTIVE:
+        if ip_alias_present:
+            ocf.logger.debug(
+                f"[monitor_route_pair]: IP alias '{ip}' is active, "
+                f"and route pair '{route_pair.name}' {state_info}"
+            )
+            return ocf.OCF_SUCCESS
+        ocf.logger.debug(
+            f"[monitor_route_pair]: Route pair '{route_pair.name}' "
+            f"{state_info}, but IP alias '{ip}' is not active"
+        )
+        return ocf.OCF_ERR_GENERIC
+
+    # ocf.is_probe() is handled within the base monitor,
+    # so PEER_ROUTE_ACTIVE is an error, as well as CONFLICT
+    ocf.logger.error(
+        f"[monitor_route_pair]: Pair of routes '{route_pair.name}' {state_info}"
+    )
+    return ocf.OCF_ERR_GENERIC
 
 
 def start_action(
@@ -1054,41 +1311,66 @@ def start_action(
     iflabel="",
     proxy="",
     profile="",
+    atomic="",
 ):
     """Assign the service IP.
 
     This function performs the following actions:
     - Adds the specified IP address as an alias to the given network interface or the interface matching the route's next hop.
-    - Disables the remote network route and enables the local network route.
+    - Disables the peer network route and enables the local network route.
     """
-    resource_options = _filter_resource_options(**locals())
+    start_time = time.monotonic()
+    timeout_ms = int(os.environ.get("OCF_RESKEY_CRM_meta_timeout", "60000"))
+    op_deadline = start_time + timeout_ms / 1000
+
+    resource_options = _filter_resource_options(locals())
 
     ocf.logger.info("[start_action]: enabling overlay IP")
     ocf.logger.debug(f"[start_action]: options: '{resource_options}'")
 
-    # Disable remote route and update node attribute
-    _attempt_remote_route_disable(resource_options)
+    route_pair = RoutePair(**resource_options)
 
-    # Create local route
-    local_route = _create_route_instance(resource_options)
-    assert local_route is not None
+    state, state_info = route_pair.get_state()
 
-    # Add IP alias
-    ip_alias_add(ip, local_route.device, local_route.iflabel)
+    if state == RoutePairState.LOCAL_ROUTE_ACTIVE:
+        ocf.logger.info(
+            f"[start_action]: local route already active in '{route_pair.name}', "
+            "nothing to do"
+        )
+        return ocf.OCF_SUCCESS
 
-    # Enable local route
-    _enable_route(local_route)
+    if state == RoutePairState.INACTIVE:
+        route_pair.enable_local()
+    else:
+        route_pair.switch_enable()
 
-    # Validate with monitor
-    monitor_result = monitor_action(**resource_options)
+    try:
+        ip_alias_add(ip, route_pair.device, route_pair.iflabel)
+        route_pair.wait_until_deployed(op_deadline)
+    except Exception:
+        ocf.logger.error(
+            f"[start_action]: failed after enabling route; rolling back IP alias '{ip}'"
+        )
+        ip_alias_remove(ip)
+        raise
+
+    try:
+        route_pair.refresh(RouteScope.PEER)
+    except SystemExit:
+        ocf.logger.warning(
+            "[start_action]: failed to refresh peer route state; "
+            "continuing without peer route data"
+        )
+    monitor_result = monitor_route_pair(route_pair, ip)
     if monitor_result != ocf.OCF_SUCCESS:
-        raise PowerCloudRouteError(
-            f"start_action: failed to enable local route '{local_route.route_name}'",
+        raise RoutePairError(
+            f"start_action: failed to enable local route in '{route_pair.name}'",
             monitor_result,
         )
 
     ocf.logger.info(
-        f"[start_action]: successfully added IP alias '{ip}' and enabled local route '{local_route.route_name}'"
+        f"[start_action]: successfully added IP alias '{ip}', "
+        f"and enabled local route in '{route_pair.name}'"
     )
     return ocf.OCF_SUCCESS
 
@@ -1105,6 +1387,7 @@ def stop_action(
     iflabel="",
     proxy="",
     profile="",
+    atomic="",
 ):
     """Remove the service IP.
 
@@ -1112,35 +1395,34 @@ def stop_action(
     - Disables the network route in the local workspace.
     - Removes the IP alias from the network interface.
     """
-
-    resource_options = _filter_resource_options(**locals())
+    resource_options = _filter_resource_options(locals())
 
     ocf.logger.info("[stop_action]: disabling overlay IP")
     ocf.logger.debug(f"[stop_action]: options: '{resource_options}'")
 
+    route_pair = RoutePair(**resource_options)
     try:
-        # Instantiate local route
-        local_route = _create_route_instance(resource_options)
-        assert local_route is not None
-        _disable_route(local_route, is_remote=False)
+        route_pair.disable_local()
     finally:
-        # Remove IP alias
         ip_alias_remove(ip)
 
-    # Validate with monitor
-    monitor_result = monitor_action(**resource_options)
+    try:
+        route_pair.refresh(RouteScope.LOCAL)
+    except SystemExit:
+        ocf.logger.warning(
+            "[stop_action]: failed to refresh local route state; "
+            "continuing without updated route data"
+        )
+    monitor_result = monitor_route_pair(route_pair, ip)
     if monitor_result != ocf.OCF_NOT_RUNNING:
-        raise PowerCloudRouteError(
-            f"stop_action: failed to disable local route '{local_route.route_name}'",
+        raise RoutePairError(
+            f"stop_action: failed to disable local route in '{route_pair.name}'",
             monitor_result,
         )
 
-    # Clean up node attribute
-    if crm_attribute_get(CRM_ATTR_REMOTE_ROUTE_STATUS) is not None:
-        crm_attribute_delete(CRM_ATTR_REMOTE_ROUTE_STATUS)
-
     ocf.logger.info(
-        f"[stop_action]: successfully removed IP alias '{ip}' and disabled local route '{local_route.route_name}'"
+        f"[stop_action]: successfully removed IP alias '{ip}' "
+        f"and disabled local route in '{route_pair.name}'"
     )
     return ocf.OCF_SUCCESS
 
@@ -1157,8 +1439,9 @@ def monitor_action(
     iflabel="",
     proxy="",
     profile="",
+    atomic="",
 ):
-    """Monitor the service IP and local route state.
+    """Monitor the service IP and route state.
 
     Monitoring has two modes:
     - Basic monitor:
@@ -1166,112 +1449,32 @@ def monitor_action(
       This is used for probe operations and when API-backed monitoring is
       disabled.
     - Extended monitor:
-      Validates the consistency of the local resource state by checking both
-      the local IP alias and the local PowerVS route. This mode is used during
-      start validation and during regular monitor operations when
-      monitor_api=true.
-
-    During non-probe monitor operations, the function checks the
-    CRM_ATTR_REMOTE_ROUTE_STATUS node attribute. If set to UNKNOWN,
-    it attempts to disable the remote route on a best-effort basis.
-
-    Remote-route checks are advisory only:
-    - failure to instantiate the remote route does not fail monitor
-    - a remote route found enabled does not fail monitor
-    - remote-route cleanup failures do not fail monitor
-
-    This behavior is intentional: remote-route issues must not trigger a
-    resource restart. The monitor result is therefore determined only by the
-    local resource state.
+      Validates the consistency of the local resource state by checking the
+      local IP alias, the local route, and the peer route. This mode is used
+      when monitor_api=true.
     """
+    resource_options = _filter_resource_options(locals())
 
-    resource_options = _filter_resource_options(**locals())
-    is_probe = ocf.is_probe()
-    is_start_action = ocf.OCF_ACTION == "start"
-    use_extended_monitor = is_start_action or (
-        str(monitor_api).lower() == "true" and not is_probe
-    )
+    use_base_monitor = str(monitor_api).lower() == "false" or ocf.is_probe()
 
+    ocf.logger.info("[monitor_action]: monitor overlay IP")
     ocf.logger.debug(
-        f"[monitor_action]: options: '{resource_options}', is_probe: '{is_probe}'"
+        f"[monitor_action]: options: '{resource_options}', is_probe: '{ocf.is_probe()}'"
     )
+    #
+    # Base monitor
 
-    # Check if remote route disable is needed during regular monitor
-    if not is_probe:
-        remote_route_disable_status = crm_attribute_get(CRM_ATTR_REMOTE_ROUTE_STATUS)
-        if remote_route_disable_status == "UNKNOWN":
-            ocf.logger.debug(
-                f"[monitor_action]: {CRM_ATTR_REMOTE_ROUTE_STATUS}=UNKNOWN detected, attempting to disable the remote route"
-            )
-            _attempt_remote_route_disable(resource_options)
-
-    interface_name = ip_find_device(ip)
-    ip_alias_present = interface_name is not None
-
-    # Simple monitor: only check if IP alias is configured
-    if not use_extended_monitor:
-        if ip_alias_present:
+    if use_base_monitor:
+        if ip_find_device(ip) is not None:
             ocf.logger.debug(f"[monitor_action]: IP alias '{ip}' is active")
             return ocf.OCF_SUCCESS
         ocf.logger.debug(f"[monitor_action]: IP alias '{ip}' is not active")
         return ocf.OCF_NOT_RUNNING
+    #
+    # Extended monitor
 
-    # Extended monitor: validate routes and their states
-    # Remote-route issues are advisory only and must not trigger restart.
-    remote_route = _create_route_instance(
-        resource_options, is_remote_route=True, catch_exception=True
-    )
-    if remote_route is None:
-        ocf.logger.warning("[monitor_action]: failed to instantiate remote route")
-    else:
-        if remote_route.is_enabled():
-            ocf.logger.warning(
-                f"[monitor_action]: remote route '{remote_route.route_name}' is enabled"
-            )
-
-    # Check local route state; local issues determine the monitor result.
-    local_route = _create_route_instance(
-        resource_options, is_remote_route=False, catch_exception=True
-    )
-    if local_route is None and is_start_action:
-        ocf.logger.error("[monitor_action]: failed to instantiate local route")
-        return ocf.OCF_ERR_GENERIC
-    elif local_route is None and ip_alias_present:
-        ocf.logger.warning(
-            "[monitor_action]: failed to instantiate local route, but IP alias is active"
-        )
-        return ocf.OCF_SUCCESS
-    elif local_route is None:
-        ocf.logger.error(
-            "[monitor_action]: failed to instantiate local route and IP alias is not active"
-        )
-        return ocf.OCF_ERR_GENERIC
-
-    # At this point the local route is instantiated. Check consistency between
-    # the local IP alias state and the local route state.
-    route_enabled = local_route.is_enabled()
-
-    if ip_alias_present and route_enabled:
-        ocf.logger.debug(
-            f"[monitor_action]: IP alias '{ip}' is active, local route '{local_route.route_name}' is enabled"
-        )
-        return ocf.OCF_SUCCESS
-    elif ip_alias_present and not route_enabled:
-        ocf.logger.error(
-            f"[monitor_action]: local route '{local_route.route_name}' is not enabled"
-        )
-        return ocf.OCF_ERR_GENERIC
-    elif not ip_alias_present and route_enabled:
-        ocf.logger.error(
-            f"[monitor_action]: local route '{local_route.route_name}' is enabled, but IP alias is not configured"
-        )
-        return ocf.OCF_ERR_GENERIC
-    else:
-        # Both IP alias and route are disabled
-        ocf.logger.debug(
-            f"[monitor_action]: IP alias '{ip}' is not active and local route '{local_route.route_name}' is disabled"
-        )
-        return ocf.OCF_NOT_RUNNING
+    route_pair = RoutePair(**resource_options)
+    return monitor_route_pair(route_pair, ip)
 
 
 def validate_all_action(
@@ -1286,23 +1489,13 @@ def validate_all_action(
     iflabel="",
     proxy="",
     profile="",
+    atomic="",
 ):
-    """Validates the provided resource agent options by attempting to instantiate route objects for both local and remote routes."""
+    """Validates the provided resource agent options by instantiating the route pair."""
+    resource_options = _filter_resource_options(locals())
 
-    resource_options = _filter_resource_options(**locals())
-
-    ocf.logger.info("[validate_all_action]: validate local and remote routes")
-
-    # Validate local route
-    _ = _create_route_instance(resource_options)
-
-    # Validate remote route
-    remote_route = _create_route_instance(
-        resource_options, is_remote_route=True, catch_exception=True
-    )
-    if remote_route is None:
-        ocf.logger.warning("[validate_all_action]: failed to instantiate remote route")
-
+    ocf.logger.info("[validate_all_action]: validate local and peer routes")
+    RoutePair(**resource_options)
     return ocf.OCF_SUCCESS
 
 
@@ -1337,14 +1530,15 @@ def main():
             For detailed guidance on high availability for SAP applications on PowerVS, visit:
             https://cloud.ibm.com/docs/sap?topic=sap-ha-overview.
         """),
-        version=1.1,
+        version=2.0,
     )
 
     agent.add_parameter(
         "ip",
         shortdesc="IP address",
         longdesc=(
-            "The virtual IP address is the destination address of a network route."
+            "The virtual IP address is the destination address of a network route. "
+            "Only IPv4 addresses are supported."
         ),
         content_type="string",
         required=True,
@@ -1392,8 +1586,9 @@ def main():
         "route_host_map",
         shortdesc="Mapping of hostnames to IBM Cloud route CRNs",
         longdesc=(
-            "Mapping of the hostname of the Power Virtual Server instance to the route CRN of the overlay IP route. "
-            "Separate the hostname and route CRN with a colon ':', separate different hostname and route CRN pairs with a semicolon ';'. "
+            "Mapping of the hostname of the Power Virtual Server instance to the "
+            "route CRN of the overlay IP route. Separate the hostname and route CRN "
+            "with a colon ':', separate different hostname and route CRN pairs with a semicolon ';'. "
             "Exactly two entries are allowed. "
             "Example: hostname1:route-crn-of-instance1;hostname2:route-crn-of-instance2"
         ),
@@ -1429,7 +1624,8 @@ def main():
         longdesc=(
             "Network adapter for the overlay IP address. "
             "The adapter must have the same name on all Power Virtual Server instances. "
-            "If the `device` parameter is not specified, the IP alias is assigned to the interface whose configured IP address matches the route's next hop address. "
+            "If the `device` parameter is not specified, the IP alias is assigned to the "
+            "interface whose configured IP address matches the route's next hop address. "
         ),
         content_type="string",
         default="",
@@ -1474,17 +1670,30 @@ def main():
         required=False,
     )
 
-    agent.add_action("start", timeout=RESOURCE_AGENT_TIMEOUT, handler=start_action)
-    agent.add_action("stop", timeout=RESOURCE_AGENT_TIMEOUT, handler=stop_action)
+    agent.add_parameter(
+        "atomic",
+        shortdesc="Atomic update of the route pair",
+        longdesc=("Atomically enable one route and disable another."),
+        content_type="string",
+        default="False",
+        required=False,
+    )
+
+    agent.add_action(
+        "start", timeout=RESOURCE_AGENT_START_TIMEOUT, handler=start_action
+    )
+    agent.add_action("stop", timeout=RESOURCE_AGENT_STOP_TIMEOUT, handler=stop_action)
     agent.add_action(
         "monitor",
         depth=0,
-        timeout=RESOURCE_AGENT_TIMEOUT,
+        timeout=RESOURCE_AGENT_MONITOR_TIMEOUT,
         interval=RESOURCE_AGENT_INTERVAL,
         handler=monitor_action,
     )
     agent.add_action(
-        "validate-all", timeout=RESOURCE_AGENT_TIMEOUT, handler=validate_all_action
+        "validate-all",
+        timeout=RESOURCE_AGENT_MONITOR_TIMEOUT,
+        handler=validate_all_action,
     )
 
     agent.run()
@@ -1492,4 +1701,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
