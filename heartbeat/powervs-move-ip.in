@@ -25,8 +25,8 @@ import fcntl
 import ipaddress
 import json
 import os
-import stat
 import socket
+import stat
 import subprocess
 import sys
 import textwrap
@@ -68,8 +68,8 @@ CRM_ATTR_REMOTE_ROUTE_STATUS = OCF_RESOURCE_INSTANCE.lower() + "_remote_route_st
 CMD_TIMEOUT = 10
 CIDR_NETMASK = "32"
 IFLABEL_MAX_LEN = 15  # Maximum character limit for interface labels
-REQUESTS_CONNECT_TIMEOUT = 5   # TCP connection timeout (seconds)
-REQUESTS_READ_TIMEOUT = 30     # Read timeout for GET / token calls (seconds)
+REQUESTS_CONNECT_TIMEOUT = 5  # TCP connection timeout (seconds)
+REQUESTS_READ_TIMEOUT = 30  # Read timeout for GET / token calls (seconds)
 REQUESTS_READ_TIMEOUT_WRITE = 60  # Read timeout for PUT / POST route calls (seconds)
 REQUESTS_TIMEOUT = (REQUESTS_CONNECT_TIMEOUT, REQUESTS_READ_TIMEOUT)
 REQUESTS_TIMEOUT_WRITE = (REQUESTS_CONNECT_TIMEOUT, REQUESTS_READ_TIMEOUT_WRITE)
@@ -769,7 +769,9 @@ class PowerCloudAPI:
 
         try:
             request_timeout = (
-                REQUESTS_TIMEOUT_WRITE if method in {"PUT", "POST"} else REQUESTS_TIMEOUT
+                REQUESTS_TIMEOUT_WRITE
+                if method in {"PUT", "POST"}
+                else REQUESTS_TIMEOUT
             )
             response = self._session.request(
                 method,
@@ -876,7 +878,7 @@ class PowerCloudRoute:
         self._remote_route_crn so that switch_enabled() can reference it.
         """
         # Strip typographic quotes that can appear when the value is copy-pasted.
-        route_host_map = route_host_map.replace('"', '').replace("'", '')
+        route_host_map = route_host_map.replace('"', "").replace("'", "")
         try:
             route_map = dict(item.split(":", 1) for item in route_host_map.split(";"))
         except ValueError:
@@ -1030,6 +1032,7 @@ class PowerCloudRoute:
                 is deployed.
         """
         soft_deadline = deadline - RESOURCE_AGENT_TIMEOUT_BUFFER
+        poll_interval = ROUTE_POLL_INTERVAL * (2 if self._atomic else 1)
 
         while time.monotonic() < soft_deadline:
             try:
@@ -1040,7 +1043,7 @@ class PowerCloudRoute:
                 ocf.logger.warning(
                     f"[PowerCloudRoute] wait_until_deployed: refresh failed; will retry"
                 )
-                time.sleep(ROUTE_POLL_INTERVAL)
+                time.sleep(poll_interval)
                 continue
 
             if self.route_info["state"] == "deployed":
@@ -1055,7 +1058,7 @@ class PowerCloudRoute:
                 f"waiting for local route '{self.route_name}' "
                 f"(current state: '{self.route_info['state']}')"
             )
-            time.sleep(ROUTE_POLL_INTERVAL)
+            time.sleep(poll_interval)
 
         raise PowerCloudRouteError(
             f"wait_until_deployed: timed out waiting for local route "
@@ -1084,9 +1087,7 @@ class PowerCloudRoute:
             f"and disabling remote route CRN '{self._remote_route_crn}'"
         )
         response = self._api.send_api_request("POST", resource, data=data)
-        ocf.logger.debug(
-            f"[PowerCloudRoute] switch_enabled: response: '{response}'"
-        )
+        ocf.logger.debug(f"[PowerCloudRoute] switch_enabled: response: '{response}'")
 
 
 def _create_route_instance(
@@ -1193,7 +1194,11 @@ def start_action(
     - For atomic==False: disables the remote network route and enables the local network route.
     """
     start_time = time.monotonic()
-    timeout_ms = int(os.environ.get("OCF_RESKEY_CRM_meta_timeout", str(RESOURCE_AGENT_TIMEOUT * 1000)))
+    timeout_ms = int(
+        os.environ.get(
+            "OCF_RESKEY_CRM_meta_timeout", str(RESOURCE_AGENT_TIMEOUT * 1000)
+        )
+    )
     op_deadline = start_time + timeout_ms / 1000
 
     resource_options = _filter_resource_options(**locals())
