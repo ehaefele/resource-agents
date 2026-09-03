@@ -769,8 +769,7 @@ class PowerCloudAPI:
 
         try:
             request_timeout = (
-                REQUESTS_TIMEOUT_WRITE
-                if method in {"PUT", "POST"}
+                REQUESTS_TIMEOUT_WRITE if method in {'PUT', 'POST'}
                 else REQUESTS_TIMEOUT
             )
             response = self._session.request(
@@ -823,7 +822,7 @@ class PowerCloudRoute:
     ):
         """Initialize PowerCloudRoute instance."""
         self._is_remote_route = is_remote_route
-        self._atomic = str(atomic).lower() == "true"
+        self._atomic = ocf.is_true(atomic)
         self._remote_route_crn = None
         self.ip = self._get_ip_info(ip)
         self.crn, self.route_id = self._parse_route_map(route_host_map)
@@ -1206,7 +1205,7 @@ def start_action(
     ocf.logger.info("[start_action]: enabling overlay IP")
     ocf.logger.debug(f"[start_action]: options: '{resource_options}'")
 
-    use_atomic = str(atomic).lower() == "true"
+    use_atomic = ocf.is_true(atomic)
 
     if use_atomic:
         # Atomic path: create local route and call switch_enabled; skip remote route management
@@ -1364,14 +1363,14 @@ def monitor_action(
     is_probe = ocf.is_probe()
     is_start_action = ocf.OCF_ACTION == "start"
     use_extended_monitor = is_start_action or (
-        str(monitor_api).lower() == "true" and not is_probe
+        ocf.is_true(monitor_api) and not is_probe
     )
 
     ocf.logger.debug(
         f"[monitor_action]: options: '{resource_options}', is_probe: '{is_probe}'"
     )
 
-    use_atomic = str(atomic).lower() == "true"
+    use_atomic = ocf.is_true(atomic)
 
     # Check if remote route disable is needed during regular monitor
     # Only applicable for non-atomic mode (atomic mode does not track remote route state)
