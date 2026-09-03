@@ -826,7 +826,7 @@ class PowerCloudRoute:
         self._remote_route_crn = None
         self.ip = self._get_ip_info(ip)
         self.crn, self.route_id = self._parse_route_map(route_host_map)
-        use_cache = str(use_token_cache).lower() == "true"
+        use_cache = ocf.is_true(use_token_cache)
         self._api = PowerCloudAPI(
             api_key=api_key,
             api_type=api_type,
