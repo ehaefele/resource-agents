@@ -7,7 +7,7 @@
 # Authors:      Edmund Haefele
 #               Walter Orb
 #
-# Copyright (c) 2024 International Business Machines, Inc.
+# Copyright (c) 2024, 2026 International Business Machines, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 # limitations under the License.
 # ------------------------------------------------------------------------
 
+import fcntl
 import ipaddress
 import json
 import math
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from pathlib import Path
 
 import requests
 import requests.adapters
@@ -40,7 +42,6 @@ import urllib3.util
 OCF_FUNCTIONS_DIR = os.environ.get(
     "OCF_FUNCTIONS_DIR", "%s/lib/heartbeat" % os.environ.get("OCF_ROOT")
 )
-
 sys.path.append(OCF_FUNCTIONS_DIR)
 
 try:
@@ -278,6 +279,8 @@ class PowerCloudAPI:
     _URL_API_PUBLIC = "https://{}.power-iaas.cloud.ibm.com"
     _URL_API_PRIVATE = "https://private.{}.power-iaas.cloud.ibm.com"
     _URL_API_BASE = "/pcloud/v1/cloud-instances/{}"
+    _IBMCLOUD_METADATA_ENDPOINT = "https://api.metadata.power-iaas.cloud.ibm.com"
+    _ALLOWED_PROFILE_SELECTORS = {"id", "name"}  # "crn" might be added in future
 
     _HTTP_MAX_RETRIES = 10
     _HTTP_BACKOFF_FACTOR = 0.4
@@ -288,6 +291,11 @@ class PowerCloudAPI:
     _RESOURCE_ACTION_TIMEOUT = int(
         int(os.environ.get("OCF_RESKEY_CRM_meta_timeout", 7200000)) / 1000
     )
+
+    # Token caching constants
+    _DEFAULT_RESOURCE_INSTANCE = "powervs-subnet"
+    _TOKEN_REFRESH_BUFFER = 900  # 15 minutes (in seconds)
+    _DEFAULT_TOKEN_EXPIRY = 300  # Default token expiry (5 minutes)
 
     def __init__(
         self,
@@ -301,6 +309,8 @@ class PowerCloudAPI:
         vsi_host_map="",
         proxy="",
         jumbo="",
+        profile="",
+        use_token_cache=False,
         use_remote_workspace=False,
     ):
         """Initialize class variables, including the API token, Cloud Resource Name (CRN), IBM Power Cloud API endpoint URL, and HTTP header."""
@@ -309,6 +319,10 @@ class PowerCloudAPI:
 
         self._validate_and_set_options()
         self._set_api_key()
+
+        # Setup token cache if enabled
+        self._cache_file = self._setup_token_cache_file() if use_token_cache else None
+
         self._set_token()
         self._set_header()
 
@@ -346,25 +360,91 @@ class PowerCloudAPI:
 
         session = self._session or self._rest_create_session()
 
-        r = session.request(
-            method, url, headers=self._header, proxies=self._proxy, **kwargs
-        )
-        if not r.ok:
+        try:
+            r = session.request(
+                method,
+                url,
+                headers=self._header,
+                proxies=self._proxy,
+                **kwargs
+            )
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+
+
             raise PowerCloudAPIError(
-                f"_rest_api_call: {method} call {resource} to {url} failed with reason: {r.reason}, status code: {r.status_code}",
+                f"_rest_api_call: request error occurred: '{method}' - '{resource}' - '{e}'",
                 ocf.OCF_ERR_GENERIC,
             )
 
-        return r.json()
+
 
     def _set_api_key(self):
-        """Store an API key in a class variable.
+        """Store an API key in a class variable and parse authentication configuration.
 
-        api_key is a string.  If the first character of the string is @,
-        the rest of the string is assumed to be the name of a file containing the API key.
+        Supports multiple authentication modes:
+        - API key: plain string or @file path
+        - Identity token with trusted profile:
+          * api_key == "identity_token" and empty profile → use default trusted profile
+          * profile == "id:profile-id" → select profile by ID
+          * profile == "name:profile-name" → select profile by name
+
+        Sets:
+            self._use_trusted_profile: bool flag indicating trusted profile mode
+            self._trusted_profile_data: dict with trusted profile info or empty dict
+            self._api_key: loaded API key string or None if using trusted profile
         """
 
         api_key = self._res_options["api_key"]
+        profile = self._res_options["profile"]
+
+        api_key_str = str(api_key).strip() if api_key else ""
+        profile_str = str(profile).strip() if profile else ""
+
+        # Trusted profile mode via identity token
+        if api_key_str.lower() == "identity_token":
+            self._use_trusted_profile = True
+
+            if not profile_str:
+                # Use default trusted profile
+                self._trusted_profile_data = {}
+                self._api_key = None
+                return
+
+            if ":" not in profile_str:
+                raise PowerCloudAPIError(
+                    f"_set_api_key: Malformed trusted profile selector: '{profile_str}'. "
+                    f"Valid formats: 'id:VALUE', 'name:VALUE'",
+                    ocf.OCF_ERR_CONFIGURED,
+                )
+
+            prefix, _, value = profile_str.partition(":")
+            prefix_lower = prefix.lower()
+            value = value.strip()
+
+            if not value:
+                raise PowerCloudAPIError(
+                    f"_set_api_key: Empty value in trusted profile selector: '{profile_str}'. "
+                    f"Expected format: '{prefix}:VALUE'",
+                    ocf.OCF_ERR_CONFIGURED,
+                )
+
+            if prefix_lower in self._ALLOWED_PROFILE_SELECTORS:
+                self._trusted_profile_data = {"trusted_profile": {prefix_lower: value}}
+                self._api_key = None
+                return
+
+            raise PowerCloudAPIError(
+                f"_set_api_key: Invalid trusted profile selector: '{profile_str}'. "
+                f"Valid prefixes are: 'id:', 'name:'",
+                ocf.OCF_ERR_CONFIGURED,
+            )
+
+        # Not trusted profile mode - load API key (handles @file or plain key)
+        self._use_trusted_profile = False
+        self._trusted_profile_data = {}
+
         if api_key[0] == "@":
             api_key_file = api_key[1:]
             try:
@@ -390,9 +470,214 @@ class PowerCloudAPI:
 
         self._api_key = api_key
 
-    def _set_token(self):
-        """Use the stored API key to obtain an IBM Cloud IAM access token."""
 
+    def _setup_token_cache_file(self):
+        """Create a token cache file with secure permissions and return a Path object."""
+        resource_instance = os.environ.get(
+            "OCF_RESOURCE_INSTANCE", self._DEFAULT_RESOURCE_INSTANCE
+        )
+        cache_file = Path(f"@HA_VARRUNDIR@/resource-agents/{resource_instance}-token.json")
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        if not cache_file.exists():
+            cache_file.touch()
+            os.chmod(cache_file, 0o600)
+        return cache_file
+
+    def _read_cache(self):
+        """Read token cache."""
+        if self._cache_file is None:
+            return {}
+        try:
+            with self._cache_file.open("r") as f:
+                fcntl.flock(f, fcntl.LOCK_SH)  # Shared lock for reading
+                try:
+                    return json.load(f)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except (json.JSONDecodeError, FileNotFoundError, PermissionError) as e:
+            ocf.logger.warning(
+                f"[PowerCloudAPI] _read_cache: failed to read token cache due to missing file or malformed JSON: '{e}'"
+            )
+            return {}
+
+    def _write_cache(self, token, expiration):
+        """Write token cache."""
+        if self._cache_file is None:
+            return
+        try:
+            with self._cache_file.open("w") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    json.dump(
+                        {
+                            "token": token,
+                            "expiration": expiration,
+                        },
+                        f,
+                    )
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception as e:
+            raise PowerCloudAPIError(
+                f"_write_cache: failed to write token cache file: '{e}'",
+                ocf.OCF_ERR_GENERIC,
+            )
+
+    def _is_token_expired(self, expiration):
+        """Check if token is expired or near expiry."""
+        return time.monotonic() + self._TOKEN_REFRESH_BUFFER >= expiration
+
+
+    def _identity_service_request(self, method, url, headers, json=None):
+        """Send a request to the PowerVS Identity Token Service.
+
+        Args:
+            method: HTTP method (GET, POST, PUT, etc.)
+            url: Full URL to request
+            headers: HTTP headers dict
+            json: Optional JSON body
+
+        Returns:
+            dict: JSON response from the service
+
+        Raises:
+            requests.RequestException: If the request fails
+        """
+        session = self._session or self._rest_create_session()
+        response = session.request(
+            method,
+            url,
+            headers=headers,
+            json=json,
+            proxies=None,  # never proxy metadata service
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _request_identity_token(self):
+        """
+        Request an identity token from the instance metadata service.
+
+        API Flow:
+          PUT  {endpoint}/identity/v1/token
+               Headers: Metadata-Flavor: ibm (required)
+               Body   : {"expires_in": <seconds>} (optional, default 300, range 5-3600)
+               Response: 201 Created
+                 {
+                   "access_token": "<identity_token>",
+                   "created_at": "<ISO8601>",
+                   "expires_at": "<ISO8601>",
+                   "expires_in": <seconds>
+                 }
+
+        Returns:
+            str: The identity token, or None if the request fails.
+
+        Notes:
+          - Metadata service calls must bypass proxies.
+          - Endpoint defaults to https://api.metadata.power-iaas.cloud.ibm.com
+        """
+        identity_url = f"{self._IBMCLOUD_METADATA_ENDPOINT}/identity/v1/token"
+        identity_headers = {"Metadata-Flavor": "ibm"}
+
+        try:
+            identity_data = self._identity_service_request(
+                "PUT",
+                identity_url,
+                identity_headers,
+                json={},  # Empty body uses default expires_in (300 seconds)
+            )
+            identity_token = identity_data.get("access_token")
+            if not identity_token:
+                ocf.logger.warning(
+                    "[PowerCloudAPI] _request_identity_token: identity token missing in response"
+                )
+                return None
+            return identity_token
+        except requests.RequestException as e:
+            ocf.logger.warning(
+                f"[PowerCloudAPI] _request_identity_token: failed to obtain identity token: '{e}'"
+            )
+            return None
+
+    def _request_bearer_token_by_identity(self):
+        """
+        Exchange an identity token for a bearer token by using the instance metadata service.
+
+        API Flow:
+          POST {endpoint}/identity/v1/iam_token
+               Headers: Authorization: Bearer <identity_token>
+               Body   : {"trusted_profile": {"id": "<id>"} | {"name": "<name>"}} (optional)
+               Response: 201 Created
+                 {
+                   "access_token": "<iam_token>",
+                   "created_at": "<ISO8601>",
+                   "expires_at": "<ISO8601>",
+                   "expires_in": <seconds>
+                 }
+
+        Returns:
+            tuple: (access_token, expiry_time) or None if the request fails.
+                   expiry_time is in monotonic time for cache comparison.
+
+        Notes:
+          - Metadata service calls must bypass proxies.
+          - The identity token is passed via Authorization header (Bearer token).
+        """
+        # Step 1: Request a new identity service token.
+        identity_token = self._request_identity_token()
+        if not identity_token:
+            return None
+
+        # Step 2: Exchange the identity token for a bearer token.
+        iam_token_url = f"{self._IBMCLOUD_METADATA_ENDPOINT}/identity/v1/iam_tokens"
+        iam_token_headers = {
+            "Authorization": f"Bearer {identity_token}",
+            "Metadata-Flavor": "ibm",
+        }
+        # Use the trusted profile data dict directly (empty dict for default profile)
+        iam_token_data = self._trusted_profile_data
+
+        current_time = time.monotonic()
+        try:
+            token_data = self._identity_service_request(
+                "POST",
+                iam_token_url,
+                iam_token_headers,
+                json=iam_token_data,
+            )
+
+            access_token = token_data.get("access_token")
+            if not access_token:
+                ocf.logger.warning(
+                    "[PowerCloudAPI] _request_bearer_token_by_identity: access token missing in response"
+                )
+                return None
+            expires_in = int(token_data.get("expires_in", self._DEFAULT_TOKEN_EXPIRY))
+            return (
+                access_token,
+                current_time + expires_in,
+            )
+        except requests.RequestException as e:
+            ocf.logger.warning(
+                f"[PowerCloudAPI] _request_bearer_token_by_identity: failed to request bearer token: '{e}'"
+            )
+            if getattr(e, "response", None) is not None:
+                data = json.loads(e.response.text)
+                message = data.get("message") or data.get("errorMessage")
+                ocf.logger.debug(
+                    f"[PowerCloudAPI] _request_bearer_token_by_identity: '{message}'"
+                )
+            return None
+
+    def _request_bearer_token_by_apikey(self):
+        """Request a new bearer token by using an API key grant.
+
+        Returns:
+            tuple: (access_token, expiry_time) or None if the request fails.
+                   expiry_time is in monotonic time for cache comparison.
+        """
         url = self._URL_IAM
 
         headers = {
@@ -403,16 +688,88 @@ class PowerCloudAPI:
             "grant_type": "urn:ibm:params:oauth:grant-type:apikey",
             "apikey": f"{self._api_key}",
         }
-        token_response = requests.post(
-            url, headers=headers, data=data, proxies=self._proxy
-        )
-        if token_response.status_code != 200:
+        current_time = time.monotonic()
+        try:
+            token_response = requests.post(
+                url, headers=headers, data=data, proxies=self._proxy
+            )
+            token_response.raise_for_status()
+            token_data = token_response.json()
+            return (
+                token_data["access_token"],
+                current_time + token_data["expires_in"],
+            )
+        except requests.RequestException as e:
+            ocf.logger.warning(
+                f"[PowerCloudAPI] _request_bearer_token_by_apikey: failed to request token: '{e}'"
+            )
+            if getattr(e, "response", None) is not None:
+                data = json.loads(e.response.text)
+                message = data.get("message") or data.get("errorMessage")
+                ocf.logger.debug(
+                        f"[PowerCloudAPI] _request_bearer_token_by_apikey: '{message}'"
+                )
+            return None
+
+    def _request_new_token(self):
+        """Request a new access token, delegating to the selected acquisition method."""
+        if self._use_trusted_profile:
+            return self._request_bearer_token_by_identity()
+        return self._request_bearer_token_by_apikey()
+
+
+    def _set_token(self):
+        """
+        Get a valid access token, using cache if enabled.
+
+        Supports two authentication modes:
+        1. Identity token (trusted profile): Uses instance metadata service
+        2. API key: Uses IBM Cloud IAM token endpoint
+
+        Token caching behavior:
+        - If cache disabled: always fetch fresh token
+        - If cache enabled:
+          * Check cached token expiration
+          * Refresh if expired or near expiry (within 15 min buffer)
+          * Use cached token as fallback if refresh fails
+        """
+        # No cache -> always fetch fresh
+        if not self._cache_file:
+            result = self._request_new_token()
+            if result:
+                token, _ = result
+                self._token = token
+                return
             raise PowerCloudAPIError(
-                f"_set_token: failed to obtain token from IBM Cloud IAM: {token_response.status_code}",
+                "_set_token: token request failed and no cache available",
                 ocf.OCF_ERR_GENERIC,
             )
 
-        self._token = json.loads(token_response.text)["access_token"]
+        # Cached mode
+        cache = self._read_cache()
+        token = cache.get("token")
+        expiration = cache.get("expiration", 0)
+
+        if not token or self._is_token_expired(expiration):
+            result = self._request_new_token()
+            if result:
+                token, expiration = result
+                ocf.logger.debug("[PowerCloudAPI] _set_token: refreshed token")
+                self._write_cache(token, expiration)
+            else:
+                ocf.logger.error(
+                    "[PowerCloudAPI] _set_token: failed to refresh token"
+                )
+                if token and time.monotonic() < expiration:
+                    ocf.logger.warning(
+                        "[PowerCloudAPI] _set_token: using cached token as fallback"
+                    )
+                else:
+                    raise PowerCloudAPIError(
+                        "_set_token: no valid token available",
+                        ocf.OCF_ERR_GENERIC,
+                    )
+        self._token = token
 
     def _set_header(self):
         """Set the Cloud Resource Name (CRN), IBM Power Cloud API endpoint URL, and HTTP header."""
@@ -677,6 +1034,15 @@ class PowerCloudAPI:
                 f"_validate_and_set_options: option api_type: {api_type} does not match public or private.",
                 ocf.OCF_ERR_CONFIGURED,
             )
+        api_key = self._res_options["api_key"]
+        if api_key[0] == "@":
+            api_key_file = api_key[1:]
+            if not os.path.exists(api_key_file):
+                raise PowerCloudAPIError(
+                    f"_validate_and_set_options: option api_key: the file specified in {api_key} does not exist.",
+                    ocf.OCF_ERR_CONFIGURED,
+                )
+
         # Set API endpoint url
         url_api_fmt = (
             self._URL_API_PRIVATE if api_type == "private" else self._URL_API_PUBLIC
@@ -792,6 +1158,7 @@ def start_action(
     vsi_host_map="",
     proxy="",
     jumbo="",
+    profile="",
 ):
     """start_action: assign the service ip.
 
@@ -860,6 +1227,7 @@ def stop_action(
     vsi_host_map="",
     proxy="",
     jumbo="",
+    profile="",
 ):
     """stop_action: unassign the service ip.
 
@@ -896,6 +1264,7 @@ def monitor_action(
     vsi_host_map="",
     proxy="",
     jumbo="",
+    profile="",
 ):
     """monitor_action: check if service ip and gateway are responding."""
 
@@ -916,7 +1285,7 @@ def monitor_action(
                 f"monitor_action: ping to ip: {ip} failed", ocf.OCF_ERR_GENERIC
             )
 
-    if not is_probe:
+    if not is_probe and gateway:
         ocf.logger.error(f"monitor_action: ping to gateway: {gateway} failed")
 
     ws = PowerCloudAPI(**res_options)
@@ -944,6 +1313,7 @@ def validate_all_action(
     vsi_host_map="",
     proxy="",
     jumbo="",
+    profile="",
 ):
     """validate_all_action: Validate the resource agent parameters."""
 
@@ -976,30 +1346,30 @@ def main():
 
     agent_description = textwrap.dedent("""\
         Resource Agent to move a Power Virtual Server subnet and its IP address
-        from one virtual server instance to another.
-        The prerequisites for the use of this resource agent are as follows:
+            from one virtual server instance to another.
+            The prerequisites for the use of this resource agent are as follows:
 
-        1. Red Hat Enterprise Linux 9.2 or higher:
-        Install with @server group to ensure that NetworkManager settings are correct.
-        Verify that the NetworkManager-config-server package is installed.
+            1. Red Hat Enterprise Linux 9.2 or higher:
+                Install with @server group to ensure that NetworkManager settings are correct.
+                Verify that the NetworkManager-config-server package is installed.
 
-        2. A two-node cluster that is distributed across two different Power Virtual Server workspaces in two data centers in a region.
+            2. A two-node cluster that is distributed across two different Power Virtual Server workspaces in two data centers in a region.
 
-        3. IBM Cloud API Key:
-        Create a service API key that is privileged for both Power Virtual Server
-        workspaces. Save the service API key in a file and copy the file to both
-        cluster nodes. Use same filename and directory location on both cluster nodes.
-        Reference the path to the key file in the resource definition.
+            3. IBM Cloud API Key:
+                Create a service API key that is privileged for both Power Virtual Server
+                workspaces. Save the service API key in a file and copy the file to both
+                cluster nodes. Use same filename and directory location on both cluster nodes.
+                Reference the path to the key file in the resource definition.
 
-        For comprehensive documentation on implementing high availability for
-        SAP applications on IBM Power Virtual Server, visit https://cloud.ibm.com/docs/sap?topic=sap-ha-overview.
+            For comprehensive documentation on implementing high availability for
+            SAP applications on IBM Power Virtual Server, visit https://cloud.ibm.com/docs/sap?topic=sap-ha-overview.
     """)
 
     agent = ocf.Agent(
         "powervs-subnet",
         shortdesc="Manages moving a Power Virtual Server subnet",
         longdesc=agent_description,
-        version=1.04,
+        version=1.1,
     )
 
     agent.add_parameter(
@@ -1050,13 +1420,18 @@ def main():
 
     agent.add_parameter(
         "api_key",
-        shortdesc="API Key or @API_KEY_FILE_PATH",
+        shortdesc="API Key, @API_KEY_FILE, or identity_token",
         longdesc=(
-            "API Key or @API_KEY_FILE_PATH for IBM Cloud access. "
-            "The API key content or the path of an API key file that is indicated by the @ symbol."
+            "IBM Cloud API key, or a file path prefixed with @ containing the API key. "
+            "If this parameter is not specified or set to its default value identity_token, "
+            "authentication is performed by using the Power Virtual Server Metadata API. "
+            "In this case, an IBM Cloud Identity and Access Management (IAM) trusted "
+            "profile is used to establish a trust relationship with the virtual server "
+            "instance, and the trusted profile can be selected with the profile parameter."
         ),
         content_type="string",
-        required=True,
+        default = "identity_token",
+        required=False,
     )
 
     agent.add_parameter(
@@ -1109,6 +1484,20 @@ def main():
         default="500",
     )
 
+    agent.add_parameter(
+        "profile",
+        shortdesc="Trusted profile name or id",
+        longdesc=(
+            "Trusted profile associated with the instance for authorization using the metadata API. "
+            "Use 'id:PROFILE_ID' to select a profile by id or "
+            "'name:PROFILE_NAME' to select a profile by name. "
+            "If not specified, the default trusted profile is used."
+        ),
+        content_type="string",
+        required=False,
+        default="",
+    )
+
 
     agent.add_action("start", timeout=900, handler=start_action)
     agent.add_action("stop", timeout=450, handler=stop_action)
@@ -1117,7 +1506,6 @@ def main():
     )
     agent.add_action("validate-all", timeout=300, handler=validate_all_action)
     agent.run()
-
 
 if __name__ == "__main__":
     main()
